@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 # TransportTools, a library for massive analyses of internal voids in biomolecules and ligand transport through them
-# Copyright (C) 2022  Jan Brezovsky <janbre@amu.edu.pl>
+# Copyright (C) 2021 The TransportTools Authors
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -746,6 +746,33 @@ class LayeredPathSet:
 
         return new_set
 
+    def build_cgo(self, color_id: int = 0, merged: bool = False, rgb: list | None = None) -> list:
+        """
+        Build the Pymol compiled graphics object(CGO) representation of this pathset's paths without
+        writing it to disk. Used both by visualize_cgo (which pickles the result) and by the supercluster
+        event-bundling that accumulates many events' CGOs into a single file.
+        :param color_id: Pymol ID of color to use for this pathset (baked into the CGO color bytes)
+        :param merged: if all paths should be combined into a single flat CGO; otherwise a list of per-path CGOs
+        :param rgb: explicit RGB color baked into the CGO, overriding color_id (used to bake residue-event colors)
+        :return: flat CGO list when merged, list of per-path CGOs otherwise
+        """
+
+        if self.nodes_data is None:
+            raise RuntimeError("No data for visualization of PathSet from {}".format(self.entity_label))
+
+        node_data = dict(zip(self.node_labels, self.nodes_data))
+        pathset_cgos = list()
+        for path in self.node_paths:
+            xyz = node_data[path[0]][:3].reshape(1, 3)
+            for node_label in path[1:]:
+                xyz = np.concatenate((xyz, node_data[node_label][:3].reshape(1, 3)), axis=0)
+            if merged:
+                pathset_cgos.extend(convert_coords2cgo(xyz, color_id=color_id, rgb=rgb))
+            else:
+                pathset_cgos.append(convert_coords2cgo(xyz, color_id=color_id, rgb=rgb))
+
+        return pathset_cgos
+
     def visualize_cgo(self, output_folder: str, entity_label: str, color_id: int = 0, merged: bool = False,
                       flag: str = "", surface_cgo: bool = False):
         """
@@ -761,52 +788,39 @@ class LayeredPathSet:
         if self.nodes_data is None:
             raise RuntimeError("No data for visualization of PathSet from {} of {}".format(entity_label, output_folder))
 
-        node_data = dict(zip(self.node_labels, self.nodes_data))
         filename1 = os.path.join(output_folder, "{}_pathset{}.dump.gz".format(entity_label, flag))
         os.makedirs(os.path.dirname(filename1), exist_ok=True)
-        pathset_cgos = list()
-        if merged:
+        pathset_cgos = self.build_cgo(color_id=color_id, merged=merged)
+
+        if merged and surface_cgo:
+            from transport_tools.libs.utils import convert_spheres2cgo_surface
+            from transport_tools.libs.msms import filter_spheres
+
+            node_data = dict(zip(self.node_labels, self.nodes_data))
+            spheres = list()
             for path_id, path in enumerate(self.node_paths):
-                xyz = node_data[path[0]][:3].reshape(1, 3)
-                for node_label in path[1:]:
-                    xyz = np.concatenate((xyz, node_data[node_label][:3].reshape(1, 3)), axis=0)
-                pathset_cgos.extend(convert_coords2cgo(xyz, color_id=color_id))
+                for node_label in path:
+                    xyz = node_data[node_label][:3]
+                    radius = node_data[node_label][5]
+                    spheres.append((xyz, radius))
 
-            if surface_cgo:
-                from transport_tools.libs.utils import convert_spheres2cgo_surface
-                from transport_tools.libs.msms import filter_spheres
+            filtered_spheres = filter_spheres(spheres)
 
-                spheres = list()
-                for path_id, path in enumerate(self.node_paths):
-                    for node_label in path:
-                        xyz = node_data[node_label][:3]
-                        radius = node_data[node_label][5]
-                        spheres.append((xyz, radius))
-
-                filtered_spheres = filter_spheres(spheres)
-
-                filename2 = os.path.join(output_folder, "{}_volume{}.dump.gz".format(entity_label, flag))
-                with gzip.open(filename2, "wb") as out_stream:
-                    if self.parameters["msms"] is None:
-                        pickle.dump(convert_spheres2cgo_surface(filtered_spheres, color_id=color_id,),
+            filename2 = os.path.join(output_folder, "{}_volume{}.dump.gz".format(entity_label, flag))
+            with gzip.open(filename2, "wb") as out_stream:
+                if self.parameters["msms"] is None:
+                    pickle.dump(convert_spheres2cgo_surface(filtered_spheres, color_id=color_id,),
+                                out_stream, self.parameters["pickle_protocol"])
+                else:
+                    from transport_tools.libs.msms import msms_surface
+                    try:
+                        pickle.dump(msms_surface(self.parameters["msms"], filtered_spheres, color_id=color_id, ),
                                     out_stream, self.parameters["pickle_protocol"])
-                    else:
-                        from transport_tools.libs.msms import msms_surface
-                        try:
-                            pickle.dump(msms_surface(self.parameters["msms"], filtered_spheres, color_id=color_id, ),
-                                        out_stream, self.parameters["pickle_protocol"])
-                        except RuntimeError:
-                            logger.warning("The program 'msms' was not found or is not correctly configured.\n")
-                            logger.warning("Default calculation of surfaces will be employed.\n")
-                            pickle.dump(convert_spheres2cgo_surface(filtered_spheres, color_id=color_id, ),
-                                        out_stream, self.parameters["pickle_protocol"])
-
-        else:
-            for path_id, path in enumerate(self.node_paths):
-                xyz = node_data[path[0]][:3].reshape(1, 3)
-                for node_label in path[1:]:
-                    xyz = np.concatenate((xyz, node_data[node_label][:3].reshape(1, 3)), axis=0)
-                pathset_cgos.append(convert_coords2cgo(xyz, color_id=color_id))
+                    except RuntimeError:
+                        logger.warning("The program 'msms' was not found or is not correctly configured.\n")
+                        logger.warning("Default calculation of surfaces will be employed.\n")
+                        pickle.dump(convert_spheres2cgo_surface(filtered_spheres, color_id=color_id, ),
+                                    out_stream, self.parameters["pickle_protocol"])
 
         with gzip.open(filename1, "wb") as out_stream:
             pickle.dump(pathset_cgos, out_stream, self.parameters["pickle_protocol"])
@@ -1102,12 +1116,12 @@ class LayeredPathSet:
 
         return fragmented_path
 
-    def how_much_is_inside(self, other_set: LayeredPathSet) -> Tuple[float, float]:
+    def how_much_is_inside(self, other_set: LayeredPathSet) -> Tuple[float, float, float]:
         """
-        Computes the fraction of nodes from this set buried inside the nodes of the other set, and maximal depth
-        (counted towards starting point (SP) along shortest path)
+        Computes the fraction of nodes from this set buried inside the nodes of the other set, the maximal depth
+        (counted towards starting point (SP) along shortest path), and the minimal depth among the buried nodes
         :param other_set: other set in which the buriedness is calculated
-        :return: buriedness, and maximal depth towards SP
+        :return: buriedness, maximal depth towards SP, and minimal depth towards SP among buried nodes
         """
         if self.nodes_data is None:
             raise ValueError(f"Empty pathset {self} should not be processed")
@@ -1116,6 +1130,9 @@ class LayeredPathSet:
                                                                           self.parameters["use_cluster_spread"])
 
         max_depth = -99999999
+        # shallowest layer reached while buried; only buried nodes define the shallow end of the penetration span,
+        # since an event's peripheral (non-buried) nodes always map to surface (~0) depth and would erase any span
+        min_buried_depth = 99999999
         surface_distances = list()
 
         for node in self.node_labels:
@@ -1126,12 +1143,17 @@ class LayeredPathSet:
                 # only surface
                 surface_dist, surface_node = self._get_dist2closest_node(node, dist_mat, dist_type=1)
             surface_distances.append(surface_dist)
-            max_depth = max(max_depth, other_set.node_depths[surface_node])
+            depth = other_set.node_depths[surface_node]
+            max_depth = max(max_depth, depth)
+            if surface_dist == 0:  # node is buried inside the other set
+                min_buried_depth = min(min_buried_depth, depth)
 
         num_buried_nodes = np.count_nonzero(np.array(surface_distances) == 0)
         buriedness = num_buried_nodes / self.nodes_data.shape[0]
+        if num_buried_nodes == 0:  # nothing buried -> no span; fall back to max_depth so the span evaluates to zero
+            min_buried_depth = max_depth
 
-        return buriedness, max_depth
+        return buriedness, max_depth, min_buried_depth
 
     def get_fragmented_paths(self) -> Tuple[int, List[List[List[str]]]]:
         """
@@ -1890,13 +1912,11 @@ class LayeredRepresentationOfTunnels(LayeredRepresentation):
                                                                                         self.md_label))
         num_points = self.points_mat.shape[0]
 
-        # assign tunnel ids
+        # assign tunnel ids: row i's id equals the number of end points (col 5 < 0) seen strictly
+        # before row i, i.e. a cumsum of the end-point flags shifted right by one
         self.points_mat = np.append(self.points_mat, np.zeros((num_points, 1)), axis=1)
-        tunnel_id = 0
-        for point in self.points_mat:
-            point[6] = tunnel_id
-            if point[5] < 0:  # end point
-                tunnel_id += 1
+        end_point_flags = self.points_mat[:, 5] < 0
+        self.points_mat[:, 6] = np.concatenate(([0], np.cumsum(end_point_flags[:-1])))
 
         layer_ids, layers = assign_layer_from_distances(self.points_mat[:, 3], self.layer_thickness)
         for layer_id in layer_ids:

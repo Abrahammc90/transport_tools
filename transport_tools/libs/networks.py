@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 # TransportTools, a library for massive analyses of internal voids in biomolecules and ligand transport through them
-# Copyright (C) 2022  Jan Brezovsky <janbre@amu.edu.pl>
+# Copyright (C) 2021 The TransportTools Authors
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -27,6 +27,7 @@ import pickle
 import tarfile
 import gzip
 import numpy as np
+from collections import OrderedDict
 from threadpoolctl import threadpool_limits
 from logging import getLogger
 from multiprocessing import Pool, get_context
@@ -337,29 +338,35 @@ class Network:
 
                 view_out.write("cmd.disable('{}*')\n\n".format(self.orig_entities[0].entity_pymol_label[0:3]))
 
-    def save_layered_visualization(self, save_pdb_files: bool = False):
+    def save_layered_visualization(self, save_pdb_files: bool = False, save_cgo_files: bool = True):
         """
         Saves CGO files with layered entities (LayeredPathSet representing transport events or tunnel clusters)
         and optionally also PDBs of transformed protein structure and tunnel starting point
         :param save_pdb_files: if the PDB files are to be saved
+        :param save_cgo_files: if a per-entity CGO file is to be written; disabled for transport events when
+                               bundle_events_visualization is on, since stage 9 then builds bundled CGOs from
+                               the layered_network.dump instead of one file per event
         """
 
         if self.layered_viz_path is None:
             raise ValueError("Output folder for layered_visualization not correctly specified in variable "
                              "'self.layered_viz_path'")
 
-        os.makedirs(self.layered_viz_path, exist_ok=True)
+        if save_pdb_files:
+            os.makedirs(self.layered_viz_path, exist_ok=True)
+            if self.transformed_pdb_file_name is None:
+                raise ValueError("Variable 'self.transformed_pdb_file_name' is not specified")
+            Point([0, 0, 0]).save_point(os.path.join(self.layered_viz_path, "origin.pdb"))
+            self._save_transformed_pdb_file(os.path.join(self.layered_viz_path, self.transformed_pdb_file_name))
+
+        if not save_cgo_files:
+            # Nothing per-entity to write (e.g. bundled event visualization); do not create empty viz folders.
+            return
 
         if self.entity_pymol_abbreviation is None:
             raise ValueError("Variable 'self.entity_pymol_abbreviation' is not specified")
 
         os.makedirs(os.path.join(self.layered_viz_path, "paths"), exist_ok=True)
-
-        if save_pdb_files:
-            if self.transformed_pdb_file_name is None:
-                raise ValueError("Variable 'self.transformed_pdb_file_name' is not specified")
-            Point([0, 0, 0]).save_point(os.path.join(self.layered_viz_path, "origin.pdb"))
-            self._save_transformed_pdb_file(os.path.join(self.layered_viz_path, self.transformed_pdb_file_name))
 
         for entity_id, layered_path_set in self.layered_entities.items():
             # Use per-entity visualization_prefix if available (e.g. for mixed-residue aqueduct networks)
@@ -591,6 +598,49 @@ class Tunnel:
             self.bottleneck_xyz = transform_mat.dot(self.bottleneck_xyz)[0:3]
         self.bottleneck_residues = [res.strip() for res in bottleneck_data[4:]]
 
+    def compute_layer_membership(self):
+        """
+        Assign each sphere of this tunnel to a spherical layer around the general starting point at the
+        origin. Must be recomputed whenever spheres_data changes (e.g. after tunnel pruning).
+        """
+
+        if self.spheres_data is None:
+            raise ValueError(f"Tunnel sphere data must be provided before useage for tunnel {self.tunnel_id} of cluster {self.caver_cluster_id}")
+
+        self.layer_membership = assign_layer_from_distances(einsum_dist(self.spheres_data[:, 0:3],
+                                                                        np.array([0., 0., 0.])),
+                                                            self.parameters["layer_thickness"])[1]
+
+    def apply_relevance_filters(self):
+        """
+        Evaluate whether this tunnel is RELEVANT, i.e. wide, long and straight enough to be layered.
+        Must be re-evaluated whenever the underlying properties change (e.g. after tunnel pruning).
+        """
+
+        self.filters_passed = round(self.bottleneck_radius, 6) >= self.parameters["relevant_tunnel_min_radius"] \
+            and round(self.length, 6) >= self.parameters["relevant_tunnel_min_length"] \
+            and round(self.curvature, 6) <= self.parameters["relevant_tunnel_max_curvature"]
+
+    def recompute_length_and_curvature(self):
+        """
+        Derive length and curvature from the sphere coordinates, following CAVER's own definitions:
+        the length is the arc length of the sphere centerline starting at the first sphere, and the
+        curvature is that length divided by the straight distance between the first and last sphere.
+        Note that CAVER measures neither from the tunnel starting point - the gap between it and the
+        first sphere (reported in the 'distance' column) is excluded from both.
+
+        Reproduces the values parsed from CAVER for an unmodified tunnel, and is used to refresh them
+        once the geometry changes and CAVER can no longer supply them (e.g. after tunnel pruning).
+        """
+
+        if self.spheres_data is None:
+            raise ValueError(f"Tunnel sphere data must be provided before useage for tunnel {self.tunnel_id} of cluster {self.caver_cluster_id}")
+
+        coords = self.spheres_data[:, 0:3]
+        self.length = float(np.linalg.norm(np.diff(coords, axis=0), axis=1).sum())
+        chord = float(np.linalg.norm(coords[-1] - coords[0]))
+        self.curvature = self.length / chord if chord > 0 else float("inf")
+
     def fill_data(self, data_section: List[str]):
         """
         Processes seven lines of data from tunnel_profiles.csv produced by CAVER to create Tunnel object
@@ -613,10 +663,7 @@ class Tunnel:
                 self.length = float(array[10])
             dataset[property_name] = array[13:]
 
-        if round(self.bottleneck_radius, 6) >= self.parameters["relevant_tunnel_min_radius"] and \
-                round(self.length, 6) >= self.parameters["relevant_tunnel_min_length"] and \
-                round(self.curvature, 6) <= self.parameters["relevant_tunnel_max_curvature"]:
-            self.filters_passed = True
+        self.apply_relevance_filters()
 
         #  here we transform the data to fit the reference structure
         try:
@@ -639,9 +686,7 @@ class Tunnel:
                                "\n".format(self.parameters["caver_relative_profile_file"], self.parameters["md_label"],
                                            self.caver_cluster_id, self.snapshot))
 
-        self.layer_membership = assign_layer_from_distances(einsum_dist(self.spheres_data[:, 0:3],
-                                                                        np.array([0., 0., 0.])),
-                                                            self.parameters["layer_thickness"])[1]
+        self.compute_layer_membership()
 
     def get_closest_sphere2coords(self, xyz: np.ndarray) ->  Tuple[float, np.ndarray] | Tuple[None, None]:
         """
@@ -848,8 +893,12 @@ class TunnelCluster:
 
         subcluster = TunnelCluster(self.cluster_id, self.parameters, self.transform_mat, self.starting_point_coords)
 
+        # when no explicit snapshot selection is given, take every tunnel actually present in the cluster
+        # (sorted to keep the previous ascending iteration order); this is both correct under sparse/
+        # strided CAVER snapshot IDs and avoids scanning a dense 1..snapshots_per_simulation range that
+        # is mostly absent
         if snap_ids is None:
-            snap_ids = [*range(1, self.parameters["snapshots_per_simulation"] + 1)]
+            snap_ids = sorted(self.tunnels.keys())
 
         for snap_id in snap_ids:
             if snap_id in self.tunnels.keys():
@@ -1103,8 +1152,100 @@ class TunnelNetwork(Network):
                 assert isinstance(cluster, TunnelCluster), f"Expected TunnelCluster but got {type(cluster).__name__}"
                 cluster.add_tunnel(tmp_tunnel)
 
+        self._validate_snapshot_sampling()
+
         if self.parameters["process_bottleneck_residues"]:
             self._read_bottleneck_data()
+
+        if self.parameters["prune_tunnels"]:
+            self._prune_tunnels()
+
+    def _prune_tunnels(self):
+        """
+        Prune offensive tunnel tails (segments extending into empty solvent space)
+        in-place, per CAVER cluster, before the network is saved for downstream stages.
+        Only relevant tunnels (``filters_passed``) take part: they define the
+        consensus cut and are the only tunnels that may be shortened (when flagged
+        as inflating and/or curved); non-passing tunnels are left untouched.  For
+        truncated tunnels the derived length, curvature, layer membership and
+        relevant-tunnel filter verdicts are refreshed.
+        """
+
+        from transport_tools.libs import tunnel_pruning
+
+        tunnels = [
+            tunnel
+            for entity in self.orig_entities
+            if isinstance(entity, TunnelCluster)
+            for tunnel in entity.tunnels.values()
+        ]
+        if not tunnels:
+            logger.debug("No tunnels to prune in network of '%s'.", self.md_label)
+            return
+
+        stats = tunnel_pruning.prune_tunnels(
+            tunnels,
+            mode=self.parameters["prune_tunnels_mode"],
+            bin_size=self.parameters["prune_tunnels_bin_size"],
+            surv_perc_range=(self.parameters["prune_tunnels_survival_perc_low"],
+                             self.parameters["prune_tunnels_survival_perc_high"]),
+            core_range=(self.parameters["prune_tunnels_core_fraction_low"],
+                        self.parameters["prune_tunnels_core_fraction_high"]),
+            min_joint_threshold=self.parameters["prune_tunnels_min_joint_threshold"],
+            eff_thresh=self.parameters["prune_tunnels_eff_thresh"],
+            slope_percentile=self.parameters["prune_tunnels_slope_percentile"],
+            water_radius=self.parameters["prune_tunnels_water_radius"],
+        )
+        logger.info("Tunnel pruning in '%s': %d cluster(s), %d with cut, "
+                    "%d extending, %d offensive (%d inflating, %d curved, %d both), "
+                    "%d truncated.",
+                    self.md_label, stats["n_clusters"], stats["n_clusters_with_cut"],
+                    stats["n_extending"], stats["n_offensive"], stats["n_inflated"],
+                    stats["n_curved"], stats["n_both"], stats["n_truncated"])
+
+    def _validate_snapshot_sampling(self):
+        """
+        Cross-check the configured snapshot sampling against the CAVER snapshot IDs actually parsed.
+        Runs for free at parse time - it only inspects IDs already read - and fails fast on a clear
+        misconfiguration (wrong stride, or snapshots_per_simulation set to the trajectory length).
+        """
+
+        observed_ids = set()
+        for cluster in self.orig_entities:
+            if isinstance(cluster, TunnelCluster):
+                observed_ids.update(cluster.tunnels.keys())
+        if not observed_ids:
+            return
+
+        # cache the detected labelling on the parameters so it is derived once here at parse time and then
+        # carried along (to workers and across a resume) instead of being re-derived downstream
+        snapshot_map = utils.SnapshotFrameMap.resolve_into(self.parameters, observed_ids)
+        num = self.parameters["snapshots_per_simulation"]
+        max_id = max(observed_ids)
+
+        if snapshot_map.by_frame:
+            config_stride = self.parameters.get("caver_snapshot_stride") or 1
+            if config_stride > 1 and config_stride != snapshot_map.id_stride:
+                raise RuntimeError("CAVER snapshot IDs in {} are frame-numbered with a stride of {} "
+                                   "(every {}th frame), but 'caver_snapshot_stride' is set to {}. "
+                                   "Set 'caver_snapshot_stride' to {} or remove "
+                                   "it.".format(self.md_label, snapshot_map.id_stride,
+                                                snapshot_map.id_stride, config_stride,
+                                                snapshot_map.id_stride))
+        elif max_id * 2 < num:
+            # losing more than half of a sequentially-numbered run to tunnel-less frames is implausible;
+            # the usual cause is snapshots_per_simulation set to the trajectory length instead of the
+            # CAVER snapshot count
+            raise RuntimeError("Highest CAVER snapshot ID in {} is {}, far below 'snapshots_per_simulation' "
+                               "({}). 'snapshots_per_simulation' must be the number of CAVER snapshots; if "
+                               "CAVER analyzed a sparse trajectory, also set 'caver_snapshot_stride' "
+                               "accordingly.".format(self.md_label, max_id, num))
+        elif max_id < num:
+            # a sequential run can legitimately end tunnel-less (e.g. the structure compacts), so a modest
+            # shortfall is only a hint
+            logger.warning("Highest CAVER snapshot ID in {} is {}, below 'snapshots_per_simulation' ({}). "
+                           "If this is unexpected, check 'snapshots_per_simulation' and "
+                           "'caver_snapshot_stride'.".format(self.md_label, max_id, num))
 
     def _read_reweighting_data(self):
         """
@@ -1276,6 +1417,10 @@ class AquaductNetwork(Network):
         self.entity_pymol_abbreviation = "evt_"  # default prefix, overridden per-entity by visualization_prefix
         self.transformed_pdb_file_name = self.md_label + "_A_trans_rot.pdb"
         self.protein_pdb_filename = self.parameters["aquaduct_results_pdb_filename"]
+        # number of source-trajectory frames AQUA-DUCT analyzed (parsed from the summary's
+        # "Frames window: start:end step" line); the authoritative event frame-domain length used to
+        # validate caver_snapshot_stride. None until read_raw_paths_data parses the summary.
+        self.event_domain_length: int | None = None
 
         # Stage 9's SLURM launcher only needs the (md_label, event_label, traced_event)
         # key triples to enumerate items in submission order; the sidecar lets it skip the
@@ -1409,6 +1554,7 @@ class AquaductNetwork(Network):
             return int(filename.split("_")[2].split(".")[0])
         return 0
 
+
     @staticmethod
     def _process_single_raw_path(path_label: str, parameters: dict, traced_residue: Tuple[str, int, Tuple[int, int],
                                                                                           Tuple[int, int]],
@@ -1442,6 +1588,7 @@ class AquaductNetwork(Network):
         # read residue info from summary text file from AquaDuct
         with open(self.summary_file) as sum_stream:
             summary_text = sum_stream.readlines()
+        self.event_domain_length = utils.parse_aquaduct_frames_window(summary_text)
         try:
             start_line = summary_text.index("List of separate paths and properties\n") + 4
         except ValueError:
@@ -1785,6 +1932,35 @@ class TransportEvent:
 
         self.extend_points_front(other_event.points)
         self.modified = True
+
+    def get_frame_trace(self) -> np.ndarray:
+        """
+        Reconstruct the per-frame AQUA-DUCT trace (the traced positions of the molecule, one per simulation
+        frame) for this transition event, in the unified reference frame. Used by trace_matching to test the
+        event against the actual per-snapshot CAVER tunnels without needing the source MD trajectory.
+
+        The points are anchored to the frame range reported by AQUA-DUCT for this event type (entry events
+        forward from their first frame, release events backward from their last frame) and then clipped to that
+        range. The clipping drops the inside-point extensions appended toward the starting point during
+        process_path() - those fall outside the reported transition frames - so only the genuine per-frame trace
+        remains. The +-1 frame slips from duplicate-point removal in the source CGO stay within the range.
+        :return: array of shape (n, 4) with columns (frame, x, y, z); empty for non-transition/empty events
+        """
+
+        if not self.has_transition() or not self.points:
+            return np.empty((0, 4))
+
+        coords = np.array([point.data[0, :3] for point in self.points])
+        num_points = coords.shape[0]
+        if self.type == "entry":
+            first_frame, last_frame = self.traced_residue[2]
+            frames = first_frame + np.arange(num_points)
+        else:  # release: anchor the last point to the last reported frame
+            first_frame, last_frame = self.traced_residue[3]
+            frames = last_frame - (num_points - 1) + np.arange(num_points)
+
+        within_range = (frames >= first_frame) & (frames <= last_frame)
+        return np.column_stack((frames[within_range], coords[within_range]))
 
     def get_visualization_cgo(self) -> List[float]:
         """
@@ -2289,26 +2465,41 @@ class AquaductPath:
         network = dict()
         network["BP"] = set()
         network["SP"] = set()
-
         for id1 in range(num_obs):
-            point1 = points_dataset[id1][1]
-            if id1 not in network.keys():
-                network[id1] = set()
-            for id2 in range(id1 + 1, num_obs):
-                point2 = points_dataset[id2][1]
-                diff_in_original_order = abs(points_dataset[id1][0]-points_dataset[id2][0])
-                if diff_in_original_order == 1:  # points were originally connected in AquaDuct trace
-                    network[id1].add(id2)
-                if point1.distance2point(point2) <= 2 * self.parameters["aqauduct_ligand_effective_radius"]:
-                    # points are connected when considering ligand radii
-                    network[id1].add(id2)
+            network[id1] = set()
 
-            if point1.data[0, 3] <= self.parameters["aqauduct_ligand_effective_radius"]:
-                # point connected to SP
-                network[id1].add("SP")
-            if point1.distance2point(border_point) <= 2 * self.parameters["aqauduct_ligand_effective_radius"]:
-                # point connected to BP
-                network[id1].add("BP")
+        if num_obs == 0:
+            return network
+
+        radius = 2 * self.parameters["aqauduct_ligand_effective_radius"]
+        orig_ids = np.array([entry[0] for entry in points_dataset], dtype=float)
+        coords = np.concatenate([entry[1].data[:, 0:3] for entry in points_dataset], axis=0)
+        dist2sp = np.array([entry[1].data[0, 3] for entry in points_dataset])
+
+        # pairwise coordinate distances among points_dataset (upper triangle only, id1 < id2), via
+        # the squared-norm expansion |a-b|^2 = |a|^2 + |b|^2 - 2 a.b so only NxN and Nx3 arrays are
+        # ever materialised (no NxNx3 diff tensor)
+        sq_norms = np.einsum('ij,ij->i', coords, coords)
+        gram = coords.dot(coords.T)
+        sq_dists = np.clip(sq_norms[:, np.newaxis] + sq_norms[np.newaxis, :] - 2 * gram, 0, None)
+        pair_dists = np.sqrt(sq_dists)
+        consecutive_in_trace = np.abs(orig_ids[:, np.newaxis] - orig_ids[np.newaxis, :]) == 1
+        overlapping = pair_dists <= radius
+        connected = np.triu(consecutive_in_trace | overlapping, k=1)
+
+        id1s, id2s = np.nonzero(connected)
+        for id1, id2 in zip(id1s.tolist(), id2s.tolist()):
+            network[id1].add(id2)
+
+        sp_connected = np.nonzero(dist2sp <= self.parameters["aqauduct_ligand_effective_radius"])[0]
+        for id1 in sp_connected.tolist():
+            network[id1].add("SP")
+
+        bp_diff = coords - border_point.data[0, 0:3]
+        dist2bp = np.sqrt(np.einsum('ij,ij->i', bp_diff, bp_diff))
+        bp_connected = np.nonzero(dist2bp <= radius)[0]
+        for id1 in bp_connected.tolist():
+            network[id1].add("BP")
 
         for point1, connections in network.items():  # make contacts symmetric
             for point2 in connections:
@@ -2318,6 +2509,13 @@ class AquaductPath:
 
 
 # Super Clusters
+# process-local LRU registry of SuperCluster instances currently holding a loaded path_sets;
+# bounds how many superclusters' path_sets stay resident at once in a single worker process
+# (each load_path_sets() call, hit or miss, is an access and refreshes recency)
+_LOADED_PATH_SETS_LRU: "OrderedDict[int, SuperCluster]" = OrderedDict()
+_LOADED_PATH_SETS_LRU_CAP = 100
+
+
 class SuperCluster:
     def __init__(self, sc_id: int, parameters: dict, total_num_md_sims: int):
         """
@@ -2497,11 +2695,22 @@ class SuperCluster:
                     self.tunnel_clusters_valid[md_label][cluster_id] = False
 
     def load_path_sets(self):
-        with open(self.path_set_filename, "rb") as in_stream:
-            self.path_sets: Dict[str, LayeredPathSet] = pickle.load(in_stream)
+        if not self.path_sets:  # not already loaded in this worker
+            with open(self.path_set_filename, "rb") as in_stream:
+                self.path_sets: Dict[str, LayeredPathSet] = pickle.load(in_stream)
 
-        for path_set in self.path_sets.values():
-            path_set.parameters.update(self.parameters)  # to update config if needed
+            for path_set in self.path_sets.values():
+                path_set.parameters.update(self.parameters)  # to update config if needed
+
+        # (re-)register on every access, hit or miss: this instance may have been unpickled with
+        # path_sets already populated (e.g. it travelled into a fresh worker process via Pool
+        # initargs, or came from a checkpoint) without ever registering here, so this process-local
+        # LRU can lack an entry for it even though path_sets itself is present
+        _LOADED_PATH_SETS_LRU[self.sc_id] = self
+        _LOADED_PATH_SETS_LRU.move_to_end(self.sc_id)
+        if len(_LOADED_PATH_SETS_LRU) > _LOADED_PATH_SETS_LRU_CAP:
+            _, evicted = _LOADED_PATH_SETS_LRU.popitem(last=False)
+            evicted.path_sets = dict()
 
     def compute_space_descriptors(self) -> Tuple[int, np.ndarray]:
         """
@@ -2698,34 +2907,38 @@ class SuperCluster:
         else:
             return False
 
-    def compute_distance2transport_event(self, transport_event: LayeredPathSet) -> Tuple[float, float]:
+    def compute_distance2transport_event(self, transport_event: LayeredPathSet) -> Tuple[float, float, float]:
         """
-        Computes the fraction of nodes from Layered path that are buried inside the supercluster, and their maximal
-        depth (counted towards starting point (SP) along shortest path)
+        Computes the fraction of nodes from Layered path that are buried inside the supercluster, their maximal
+        depth (counted towards starting point (SP) along shortest path), and the minimal depth among buried nodes
         :param transport_event: Layered path representing the transport event
-        :return: path buriedness, max depth towards SP
+        :return: path buriedness, max depth towards SP, min depth towards SP among buried nodes
         """
 
         self.load_path_sets()
         return transport_event.how_much_is_inside(self.path_sets["overall"])
 
     # === methods for data reporting ===
-    def prepare_visualization(self,  md_label: str = "overall", flag: str = "") -> Tuple[List[str], Tuple[LayeredPathSet, Tuple[str, str, int, bool, str]] | None]:
+    def prepare_visualization(self,  md_label: str = "overall", flag: str = "") -> Tuple[List[str], Tuple[LayeredPathSet, Tuple[str, str, int, bool, str]] | None, Tuple[str, List[Tuple[str, str, Tuple[str, str], List[float]]]] | None]:
         """
         Prepare overall CGO files for visualization of paths representing this supercluster (SC) and generate lines
         for Pymol visualization script
         :param md_label: visualization of which simulations to prepare; by default 'overall' visualization
         :param flag: additional description enabling differentiation of cgo files among various results after filtering
-        :return: lines to load visualization of this SC into Pymol, LayeredPathSet and parameters to generate CGO file
+        :return: lines to load visualization of this SC into Pymol; LayeredPathSet and parameters to generate the
+                 SC tunnel CGO file; and (when bundling events) the event-bundle request as (bundle_basename,
+                 selection) where selection is a list of (md_label, entity_key, (event_type, resname), rgb) for the
+                 caller to materialise into the bundle - None when bundling is off or the SC has no events to show
         """
 
         plines = list()
         viz_data = None
+        bundle_request = None
 
         if md_label not in self.path_sets.keys() or md_label not in self.properties.keys() \
                 or not self.properties[md_label]:
             # pathset not created or invalid supercluster
-            return plines, viz_data
+            return plines, viz_data, bundle_request
 
         # dump CGO files for visualization of paths representing this SC
         os.makedirs(self.parameters["super_cluster_vis_path"], exist_ok=True)
@@ -2739,10 +2952,10 @@ class SuperCluster:
         if "overall" not in md_label:
             root_folder = os.path.join(root_folder, "comparative_analysis", md_label)
 
-        vis_folder = os.path.relpath(self.parameters["super_cluster_vis_path"], root_folder)
+        sc_vis_folder = os.path.relpath(self.parameters["super_cluster_vis_path"], root_folder)
         # CGO filepath for loading to Pymol
-        filename = os.path.join(vis_folder, "SC{:02d}_{}_pathset{}.dump.gz".format(self.sc_id, md_label, flag))
-        filename_vol = os.path.join(vis_folder, "SC{:02d}_{}_volume{}.dump.gz".format(self.sc_id, md_label, flag))
+        filename = os.path.join(sc_vis_folder, "SC{:02d}_{}_pathset{}.dump.gz".format(self.sc_id, md_label, flag))
+        filename_vol = os.path.join(sc_vis_folder, "SC{:02d}_{}_volume{}.dump.gz".format(self.sc_id, md_label, flag))
 
         # generate Pymol script of this SC
         plines.append("with gzip.open({}, 'rb') as in_stream:\n".format(utils.path_loader_string(filename)))
@@ -2755,7 +2968,6 @@ class SuperCluster:
             plines.append("    volume = pickle.load(in_stream)\n")
             plines.append("cmd.load_cgo(volume, 'cluster_{:03d}_vol')\n\n".format(self.sc_id))
 
-        vis_folder = os.path.relpath(self.parameters["layered_aquaduct_vis_path"], root_folder)
         comparative_groups_definition = {}
         if self.parameters["perform_comparative_analysis"] \
                 and self.parameters["comparative_groups_definition"] is not None:
@@ -2769,40 +2981,89 @@ class SuperCluster:
             for path in paths
         })
 
-        # generate Pymol script of events assigned to this SC, grouped by (event_type, residue)
-        for event_type in sorted(self.transport_events.keys()):
-            events_by_residue: Dict[str, List[str]] = {}
-            for _md_label, path_id, resname in subsample_events(self.transport_events[event_type],
-                                                                self.parameters["random_seed"],
-                                                                self.parameters["max_events_per_cluster4visualization"],
-                                                                md_label, comparative_groups_definition):
-                filename = os.path.join(vis_folder, _md_label, "paths",
-                                        "{}_{}_pathset.dump.gz".format(resname.lower() + "_" + path_id, event_type))
-                if resname not in events_by_residue:
-                    events_by_residue[resname] = []
-                events_by_residue[resname].append("{}".format(utils.path_loader_string(filename)))
+        if self.parameters["bundle_events_visualization"]:
+            # Bundle mode: emit a single per-(SC, scope) load referencing a bundle file the caller writes,
+            # holding {(event_type, resname): merged CGO} with residue colors already baked in. The selection
+            # over event identities is computed here (no geometry) and returned for the caller to materialise.
+            selection: List[Tuple[str, str, Tuple[str, str], List[float]]] = list()
+            for event_type in sorted(self.transport_events.keys()):
+                for _md_label, path_id, resname in subsample_events(self.transport_events[event_type],
+                                                                    self.parameters["random_seed"],
+                                                                    self.parameters["max_events_per_cluster4visualization"],
+                                                                    md_label, comparative_groups_definition):
+                    entity_key = "{}_{}_{}".format(resname.lower(), path_id, event_type)
+                    rgb = utils.get_residue_color(all_residues.index(resname))
+                    selection.append((_md_label, entity_key, (event_type, resname), rgb))
 
-            for resname in sorted(events_by_residue.keys()):
-                color = utils.get_residue_color(all_residues.index(resname))
-                obj_name = "{}_{:03d}".format(resname.lower() + "_" + event_type, self.sc_id)
-                plines.append("events = [{}]\n".format(",\n".join(events_by_residue[resname])))
-                plines.append("for event in events:\n")
-                plines.append("    with gzip.open(event, 'rb') as in_stream:\n")
-                plines.append("        pathset = pickle.load(in_stream)\n")
-                plines.append("        for path in pathset:\n")
-                plines.append("            path[3:6] = {}\n".format(color))
-                plines.append("            cmd.load_cgo(path, '{}')\n".format(obj_name))
-                plines.append("cmd.set('cgo_line_width', {}, '{}')\n\n".format(2, obj_name))
+            if selection:
+                bundle_basename = "SC{:02d}_{}_events{}.dump.gz".format(self.sc_id, md_label, flag)
+                bundle_relpath = os.path.join(sc_vis_folder, bundle_basename)
+                plines.append("with gzip.open({}, 'rb') as in_stream:\n".format(utils.path_loader_string(bundle_relpath)))
+                plines.append("    sc_events = pickle.load(in_stream)\n")
+                plines.append("for (event_type, resname), event_cgo in sc_events.items():\n")
+                plines.append('    obj_name = "{{}}_{{}}_{:03d}".format(resname.lower(), event_type)\n'.format(self.sc_id))
+                plines.append("    cmd.load_cgo(event_cgo, obj_name)\n")
+                plines.append("    cmd.set('cgo_line_width', 2, obj_name)\n\n")
+                bundle_request = (bundle_basename, selection)
+        else:
+            # Legacy mode: one CGO file per event (written at stage 8); recolor per residue at load time.
+            vis_folder = os.path.relpath(self.parameters["layered_aquaduct_vis_path"], root_folder)
+            for event_type in sorted(self.transport_events.keys()):
+                events_by_residue: Dict[str, List[str]] = {}
+                for _md_label, path_id, resname in subsample_events(self.transport_events[event_type],
+                                                                    self.parameters["random_seed"],
+                                                                    self.parameters["max_events_per_cluster4visualization"],
+                                                                    md_label, comparative_groups_definition):
+                    filename = os.path.join(vis_folder, _md_label, "paths",
+                                            "{}_{}_pathset.dump.gz".format(resname.lower() + "_" + path_id, event_type))
+                    if resname not in events_by_residue:
+                        events_by_residue[resname] = []
+                    events_by_residue[resname].append("{}".format(utils.path_loader_string(filename)))
 
-        return plines, viz_data
+                for resname in sorted(events_by_residue.keys()):
+                    color = utils.get_residue_color(all_residues.index(resname))
+                    obj_name = "{}_{:03d}".format(resname.lower() + "_" + event_type, self.sc_id)
+                    plines.append("events = [{}]\n".format(",\n".join(events_by_residue[resname])))
+                    plines.append("for event in events:\n")
+                    plines.append("    with gzip.open(event, 'rb') as in_stream:\n")
+                    plines.append("        pathset = pickle.load(in_stream)\n")
+                    plines.append("        for path in pathset:\n")
+                    plines.append("            path[3:6] = {}\n".format(color))
+                    plines.append("            cmd.load_cgo(path, '{}')\n".format(obj_name))
+                    plines.append("cmd.set('cgo_line_width', {}, '{}')\n\n".format(2, obj_name))
+
+        return plines, viz_data, bundle_request
+
+    def _get_per_sim_residue_event_counts(self, resname: str, sims2process: List[str]) -> Tuple[List[int], List[int]]:
+        """
+        Counts entry and release events of a given residue for each simulation in sims2process, using 0 for
+        simulations that contributed no such event; used as the sample for per-residue mean/stdev reporting
+        :param resname: residue name to count events for
+        :param sims2process: md_labels of all simulations belonging to the group being summarized
+        :return: (per-sim entry counts, per-sim release counts), aligned with sims2process
+        """
+
+        entry_events = self.transport_events.get("entry", {})
+        release_events = self.transport_events.get("release", {})
+
+        entry_counts = [sum(1 for _, traced_event in entry_events.get(sim, [])
+                            if traced_event[0].split(":")[0] == resname) for sim in sims2process]
+        release_counts = [sum(1 for _, traced_event in release_events.get(sim, [])
+                              if traced_event[0].split(":")[0] == resname) for sim in sims2process]
+
+        return entry_counts, release_counts
 
     def get_summary_line_data(self, print_transport_events: bool = False, md_label: str = "overall",
-                              residue_names: List[str] | None = None) -> List[str]:
+                              residue_names: List[str] | None = None,
+                              sims2process: List[str] | None = None) -> List[str]:
         """
         Generates data for creation of line summarizing overall properties of this supercluster (SC)
         :param print_transport_events: if properties related to transport events should be reported
         :param md_label: summary of which simulations to report; by default report 'overall' stats
         :param residue_names: sorted list of residue names for per-residue event columns; None = skip
+        :param sims2process: md_labels of all simulations belonging to md_label's group, used to compute
+                             per-residue mean/stdev of event counts (0-filled for silent simulations);
+                             required when residue_names is set
         :return: list of items for the summary line
         """
         data = ["{:d}".format(self.sc_id)]
@@ -2830,13 +3091,19 @@ class SuperCluster:
                 data.append("{:d}".format(self.num_events[md_label]["entry"]))
                 data.append("{:d}".format(self.num_events[md_label]["release"]))
             if residue_names:
+                if not sims2process:
+                    raise ValueError("sims2process must be provided (non-empty) when residue_names is set")
                 res_counts = self.num_events_by_residue.get(md_label, {})
                 for resname in residue_names:
                     if resname in res_counts:
-                        data.append("{:d}".format(res_counts[resname]["entry"]))
-                        data.append("{:d}".format(res_counts[resname]["release"]))
+                        entry_counts, release_counts = self._get_per_sim_residue_event_counts(
+                            resname, sims2process)
+                        data.append("{:.1f}".format(np.average(entry_counts)))
+                        data.append("{:.1f}".format(np.std(entry_counts)))
+                        data.append("{:.1f}".format(np.average(release_counts)))
+                        data.append("{:.1f}".format(np.std(release_counts)))
                     else:
-                        data.extend(["-", "-"])
+                        data.extend(["-", "-", "-", "-"])
 
         return data
 
@@ -3402,8 +3669,11 @@ class TunnelProfile4MD:
         for snapshot_id, tunnel in self.records.items():
             values[snapshot_id] = getattr(tunnel, property_name)
         array = list()
-        for frame_id in range(self.parameters["snapshots_per_simulation"]):
-            caver_id = frame_id + self.parameters["caver_traj_offset"]
+        # iterate the analysed-snapshot domain (1..N for dense/sequential CAVER output, the actual sparse
+        # IDs for strided by-frame output) rather than a dense 0..N-1 frame range plus a fixed offset; the
+        # profile's own snapshot IDs let the map detect the labelling
+        snapshot_map = utils.SnapshotFrameMap.from_parameters(self.parameters, observed_ids=self.records.keys())
+        for caver_id in snapshot_map.snapshot_ids():
             if caver_id in values.keys():
                 array.append(values[caver_id])
             else:

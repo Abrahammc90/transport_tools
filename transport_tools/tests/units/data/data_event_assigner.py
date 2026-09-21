@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 # TransportTools, a library for massive analyses of internal voids in biomolecules and ligand transport through them
-# Copyright (C) 2022  Jan Brezovsky <janbre@amu.edu.pl>
+# Copyright (C) 2021 The TransportTools Authors
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -31,17 +31,52 @@ test_parameters_minimal = {
     "event_assignment_cutoff": 0.5,
     "ambiguous_event_assignment_resolution": "penetration_depth",
     "perform_exact_matching_analysis": False,
+    "perform_trace_matching_analysis": False,
     "caver_traj_offset": 1,
     "trajectory_path": "/tmp/test_traj",
     "folder_pattern4exact_matching_analysis": "md*",
     "exact_matching_details_folder": "/tmp/test_exact",
+    "trace_matching_details_folder": "/tmp/test_trace",
     "trajectory_engine": "mdtraj",
-    "aqauduct_ligand_effective_radius": 1.5
+    "aqauduct_ligand_effective_radius": 1.5,
+    "snapshots_per_simulation": 1000
 }
 
 test_parameters_exact_matching = test_parameters_minimal.copy()
 test_parameters_exact_matching["perform_exact_matching_analysis"] = True
 test_parameters_exact_matching["ambiguous_event_assignment_resolution"] = "exact_matching"
+
+test_parameters_trace_matching = test_parameters_minimal.copy()
+test_parameters_trace_matching["perform_trace_matching_analysis"] = True
+test_parameters_trace_matching["ambiguous_event_assignment_resolution"] = "trace_matching"
+
+test_parameters_penetration_span = test_parameters_minimal.copy()
+test_parameters_penetration_span["ambiguous_event_assignment_resolution"] = "penetration_span"
+
+test_parameters_directionality = test_parameters_minimal.copy()
+test_parameters_directionality["ambiguous_event_assignment_resolution"] = "directionality"
+
+# Sampling-stride (frame -> CAVER snapshot) parameters for trace matching. CAVER analysed 1000
+# snapshots of a 20000-frame trajectory (stride 20), so only every 20th event frame lands on an analysed
+# snapshot. perform_trace_matching_analysis is off so the matching writes no detail files during the test.
+test_parameters_trace_matching_strided = test_parameters_trace_matching.copy()
+test_parameters_trace_matching_strided["snapshots_per_simulation"] = 1000
+test_parameters_trace_matching_strided["caver_snapshot_stride"] = 20
+test_parameters_trace_matching_strided["perform_trace_matching_analysis"] = False
+
+# Stride-1 (dense) back-compatible counterpart: every event frame maps to its own snapshot (legacy f+offset).
+test_parameters_trace_matching_dense = test_parameters_trace_matching.copy()
+test_parameters_trace_matching_dense["snapshots_per_simulation"] = 1000
+test_parameters_trace_matching_dense["caver_snapshot_stride"] = 1
+test_parameters_trace_matching_dense["perform_trace_matching_analysis"] = False
+
+# Strided counterpart with interpolation on: frames between snapshots are matched against their nearest
+# analysed snapshot instead of being skipped, so every event frame resolves to some snapshot.
+test_parameters_trace_matching_strided_interp = test_parameters_trace_matching_strided.copy()
+test_parameters_trace_matching_strided_interp["interpolate_missing_snapshots4matching"] = True
+
+# Per-frame ligand trace [frame, x, y, z] spanning the event window (frames 10..50) for these matching tests.
+sample_event_frame_trace = np.array([[float(f), 1.0, 1.0, 1.0] for f in range(10, 51)])
 
 # Event specification format: (md_label, event_label, (resname:resid, (start_frame, end_frame)))
 sample_event_specification_1 = ("md1", "1_entry", ("WAT:123", (10, 50)))
@@ -98,6 +133,21 @@ sample_depth_high = 15.0
 sample_depth_medium = 10.0
 sample_depth_low = 5.0
 
+# Minimal (shallow-end) depth among buried nodes, used by penetration_span to compute the traversed span
+# (max_depth - min_buried_depth). Default value for tests where the span is irrelevant (other resolutions ignore it).
+sample_min_depth = 0.0
+# penetration_span fixtures: SC1 reaches deeper (larger max_depth) but over a narrow span (perpendicular-like),
+# SC2 is shallower overall yet spans a wide depth range (a genuine surface->core traversal):
+#   SC1 span = sample_depth_high  - sample_min_depth_narrow = 15.0 - 14.0 = 1.0
+#   SC2 span = sample_depth_medium - sample_min_depth_wide   = 10.0 -  2.0 = 8.0
+sample_min_depth_narrow = 14.0
+sample_min_depth_wide = 2.0
+
+# Supercluster avg_direction vectors for directionality resolution tests, compared against the entry event's
+# terminal-node direction [2, 2, 2] (sample_nodes_data_entry): one aligned (0 deg), one well off-axis (~70 deg).
+sample_direction_aligned = np.array([2.0, 2.0, 2.0])
+sample_direction_offaxis = np.array([2.0, 2.0, -2.0])
+
 # Expected return format from perform_assignment
 # (event_specification, assigned_sc_ids, max_buriedness, max_depth)
 expected_assignment_success = (
@@ -143,6 +193,20 @@ sample_exact_matching_buriedness = {
 sample_exact_matching_no_tunnels = {
     "4all_frames": {},
     "4existing_tunnels": {}
+}
+
+# Tunnels from the candidate SCs exist in the event's frames, but the ligand is never inside any of them
+# (all-zero matched buriedness) - the other degenerate matching case, which must fall back to a geometric
+# resolution rather than keeping every candidate unfiltered
+sample_exact_matching_all_zero = {
+    "4all_frames": {
+        1: 0.0,
+        2: 0.0
+    },
+    "4existing_tunnels": {
+        1: 0.0,
+        2: 0.0
+    }
 }
 
 # Mock trajectory coordinates for ligand

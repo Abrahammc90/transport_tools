@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 # TransportTools, a library for massive analyses of internal voids in biomolecules and ligand transport through them
-# Copyright (C) 2022  Jan Brezovsky <janbre@amu.edu.pl>
+# Copyright (C) 2021 The TransportTools Authors
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -25,6 +25,8 @@ import os
 import pytest
 from transport_tools.libs.utils import set_paths_from_package_root, prep_test_config, compare_test_folders, compare_test_files
 from transport_tools.libs.tools import load_checkpoint, define_filters, TransportProcesses, save_checkpoint
+from transport_tools.tests.integration.generate_event_assignment_fixtures import (
+    EVENT_ASSIGNMENT_VARIANTS, variant_artifacts, trace_analysis_dir)
 
 class TestTransportProcesses(unittest.TestCase):
     @pytest.fixture(autouse=True)
@@ -108,6 +110,100 @@ class TestTransportProcesses(unittest.TestCase):
         compare_test_folders(os.path.join(self.saved_data, "visualization", "sources", "network_data", "caver", "md1"),
                               os.path.join(self.out_path, "visualization", "sources", "network_data", "caver", "md1"), self)
         save_checkpoint(mol_system, self._get_dumpfile(2), overwrite=True)
+
+    @staticmethod
+    def _load_tunnel_clusters(network_data_path: str, md_label: str = "md1") -> dict:
+        """Load a stage-2 tunnel-network dump and index its tunnels by (cluster_id, snapshot_id)."""
+        import pickle
+
+        with open(os.path.join(network_data_path, "{}_caver.dump".format(md_label)), "rb") as in_stream:
+            clusters = pickle.load(in_stream)
+
+        return {(cluster.cluster_id, snap_id): tunnel
+                for cluster in clusters for snap_id, tunnel in cluster.tunnels.items()}
+
+    def test_02process_tunnel_networks_pruned(self):
+        """Stage 2 with 'prune_tunnels' enabled, golden-compared against its own fixtures and
+        checked against the unpruned baseline written by test_02process_tunnel_networks. The
+        stage-2 output paths are redirected to a variant folder so the default (unpruned) chain
+        feeding test_03+ is untouched; no checkpoint is saved. Mirrors
+        _check_super_cluster_clustering_variant for stage 5."""
+        from numpy import allclose, diff
+        from numpy.linalg import norm
+
+        try:
+            mol_system = load_checkpoint(self._get_dumpfile(1))
+        except FileNotFoundError:
+            self.skipTest("previous test not finished")
+
+        baseline_path = os.path.join(self.out_path, "_internal", "network_data", "caver")
+        if not os.path.isfile(os.path.join(baseline_path, "md1_caver.dump")):
+            self.skipTest("unpruned stage-2 baseline not available")
+
+        variant_root = os.path.join(self.out_path, "_pruning_variant")
+        variant_data = os.path.join(variant_root, "network_data", "caver")
+        variant_vis = os.path.join(variant_root, "visualization", "caver")
+        mol_system.parameters["orig_caver_network_data_path"] = variant_data
+        mol_system.parameters["orig_caver_vis_path"] = variant_vis
+        mol_system.parameters["prune_tunnels"] = True
+        mol_system.process_tunnel_networks()
+
+        # The invariants below run before the golden comparison on purpose: they hold
+        # independently of the fixtures, so a regression cannot be blessed by regenerating them.
+        baseline = self._load_tunnel_clusters(baseline_path)
+        pruned = self._load_tunnel_clusters(variant_data)
+        self.assertEqual(set(baseline.keys()), set(pruned.keys()),
+                         "pruning must not add or drop tunnels, only shorten them")
+
+        water_floor = mol_system.parameters["prune_tunnels_water_radius"]
+        truncated = 0
+        for key, before in baseline.items():
+            after = pruned[key]
+            if len(after.spheres_data) == len(before.spheres_data):
+                # untouched tunnels must come through byte-identical
+                self.assertTrue(allclose(after.spheres_data, before.spheres_data),
+                                "untouched tunnel {} was modified".format(key))
+                self.assertEqual(after.length, before.length, "untouched tunnel {}".format(key))
+                self.assertEqual(after.curvature, before.curvature, "untouched tunnel {}".format(key))
+                continue
+
+            truncated += 1
+            msg = "truncated tunnel {}".format(key)
+            # only a tail is removed - the kept spheres are the original leading ones
+            self.assertLess(len(after.spheres_data), len(before.spheres_data), msg)
+            self.assertTrue(allclose(after.spheres_data,
+                                     before.spheres_data[:len(after.spheres_data)]), msg)
+            # only relevant tunnels may be truncated
+            self.assertTrue(before.filters_passed, msg)
+            # the last kept sphere honours the water-radius floor
+            self.assertGreaterEqual(after.spheres_data[-1, 4], water_floor, msg)
+            # the bottleneck survives, so the un-refreshed CAVER value stays valid
+            self.assertEqual(after.bottleneck_radius, before.bottleneck_radius, msg)
+            self.assertAlmostEqual(float(after.spheres_data[:, 4].min()),
+                                   float(before.spheres_data[:, 4].min()), places=9, msg=msg)
+            # length/curvature are refreshed in CAVER's terms and a shortened tunnel is shorter
+            coords = after.spheres_data[:, 0:3]
+            self.assertAlmostEqual(after.length, float(norm(diff(coords, axis=0), axis=1).sum()),
+                                   places=9, msg=msg)
+            self.assertAlmostEqual(after.curvature, after.length / float(norm(coords[-1] - coords[0])),
+                                   places=9, msg=msg)
+            self.assertLess(after.length, before.length, msg)
+            # layer membership is refreshed alongside the geometry
+            self.assertEqual(len(after.layer_membership), len(after.spheres_data), msg)
+            # CAVER values that cannot be derived from sphere data are left alone
+            self.assertEqual(after.cost, before.cost, msg)
+            self.assertEqual(after.throughput, before.throughput, msg)
+            # the relevant-tunnel verdict is re-evaluated against the refreshed geometry
+            self.assertEqual(after.filters_passed,
+                             round(after.bottleneck_radius, 6) >= mol_system.parameters["relevant_tunnel_min_radius"]
+                             and round(after.length, 6) >= mol_system.parameters["relevant_tunnel_min_length"]
+                             and round(after.curvature, 6) <= mol_system.parameters["relevant_tunnel_max_curvature"],
+                             msg)
+
+        self.assertGreater(truncated, 0, "pruning did not shorten any tunnel of the test data")
+
+        compare_test_folders(os.path.join(self.saved_data, "tunnel_pruning", "md1"),
+                              os.path.join(variant_vis, "md1"), self)
 
     def test_02process_tunnel_networks_slurm(self):
         """Same checks as test_02process_tunnel_networks, but is computed via the SLURM
@@ -1542,12 +1638,43 @@ class TestTransportProcesses(unittest.TestCase):
                                 "wiping the vis folder should force a SLURM resubmission, "
                                 "but the submitit log-file set did not grow")
 
+    def _check_event_assignment_variant(self, variant: str, param_overrides: dict):
+        """Assign transport events with the given non-default ambiguous-assignment-resolution configuration,
+        generate the initial events summary + supercluster events details, golden-compare them against the
+        per-variant fixtures, and (for trace_matching) the per-event analysis output. Each variant runs on a
+        freshly loaded stage-8 checkpoint so the assignment mutations do not leak between variants or into the
+        default exact_matching chain. The artifact set is shared with the fixture generator (variant_artifacts)
+        so producer and consumer cannot drift. Mirrors _check_super_cluster_clustering_variant for stage 5."""
+        mol_system = load_checkpoint(self._get_dumpfile(10))
+        for key, value in param_overrides.items():
+            mol_system.parameters[key] = value
+        mol_system.assign_transport_events()
+        mol_system.generate_super_cluster_summary(out_filename="3-initial_events_summary.txt")
+
+        fixtures = os.path.join(self.saved_data, "event_assignment_variants", variant)
+        try:
+            for produced, relpath in variant_artifacts(self.out_path):
+                compare_test_files(os.path.join(fixtures, relpath), produced, self)
+            if param_overrides.get("perform_trace_matching_analysis"):
+                compare_test_folders(os.path.join(fixtures, "trace_matching_analysis", "md1"),
+                                     trace_analysis_dir(self.out_path), self)
+        except AssertionError as exc:
+            raise AssertionError("[variant='{}'] {}".format(variant, exc)) from exc
+
     def test_11assign_transport_events(self):
         try:
             mol_system = load_checkpoint(self._get_dumpfile(10))
         except FileNotFoundError:
             self.skipTest("previous test not finished")
 
+        # cover the non-default ambiguous-assignment-resolution variants against per-variant fixtures; the
+        # default exact_matching chain below (which feeds the stage-9 checkpoint for test_12) is left intact.
+        # trace_matching is the trajectory-free counterpart of exact_matching, so its analysis output is also
+        # golden-compared. The variant set is shared with the fixture generator so the two cannot drift.
+        for variant, param_overrides in EVENT_ASSIGNMENT_VARIANTS:
+            self._check_event_assignment_variant(variant, param_overrides)
+
+        # default chain: exact_matching (matches the shared test config) - historical golden checks + checkpoint
         mol_system.assign_transport_events()
         mol_system.save_super_clusters_visualization(script_name="visualize_events.py")
         mol_system.generate_super_cluster_summary(out_filename="3-initial_events_summary.txt")

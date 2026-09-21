@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 # TransportTools, a library for massive analyses of internal voids in biomolecules and ligand transport through them
-# Copyright (C) 2022  Jan Brezovsky <janbre@amu.edu.pl>
+# Copyright (C) 2021 The TransportTools Authors
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -30,7 +30,7 @@ from configparser import ConfigParser
 from typing import List, Any, Tuple
 from logging import getLogger
 from transport_tools.libs.ui import initiate_tools
-from transport_tools.libs.utils import get_filepath
+from transport_tools.libs.utils import get_filepath, parse_aquaduct_frames_window
 
 logger = getLogger(__name__)
 
@@ -144,11 +144,16 @@ class AnalysisConfig:
             "layer_thickness": 1.5,  # thickness of concentric layered grid
 
             # Parsing of tunnel clusters from CAVER results
-            "snapshots_per_simulation": None,  # number of snapshots used for CAVER calculation
+            "snapshots_per_simulation": None,  # number of CAVER snapshots (analyzed frames) per simulation
             "caver_traj_offset": 1,  # difference in IDs of MD frames (from 0) and caver snapshots (often from 1)
+            "caver_snapshot_stride": 1,  # source-trajectory frames per CAVER snapshot when CAVER sampled sparsely (e.g. a 20000-frame trajectory thinned to 1000 snapshots => 20); 1 = every frame analyzed
             "snapshot_id_position": 1,  # location of IDs in snapshot filenames from CAVER split by snapshot_delimiter
             "snapshot_delimiter": ".",  # delimiter used for splitting snapshot filenames from CAVER to get IDs
             "process_bottleneck_residues": False,  # read file bottlenecks.csv
+
+            # Pruning of tunnel profiles extending into empty solvent space (per CAVER cluster, per MD)
+            "prune_tunnels": False,  # truncate offensive tunnel tails (inflating/curved) at stage 2
+            "prune_tunnels_mode": "first",  # cut selection mode: 'first' (lowest-distance threshold bin) or 'peak' (max joint score)
 
             # Clustering of tunnel clusters into superclusters
             "relevant_tunnel_cluster_min_size": 1, #filters too small cluster, applies to tunnel network processing, clusters with fewer RELEVANT tunnels are not layered at all
@@ -257,8 +262,20 @@ class AnalysisConfig:
             # ambiguous_event_assignment_resolution decides how we assign events to multiple potential superclusters,
             # possible values:
             # 'penetration_depth' - how deep the event penetrates the supercluster
+            # 'penetration_span' - how much of the surface-to-core depth range the event traverses inside the
+            # supercluster (deepest minus shallowest buried point); favours genuine traversals over events that
+            # merely cross a supercluster volume perpendicularly, without needing MD trajectories or AQUA-DUCT traces
+            # 'directionality' - how closely the event's exit bearing matches the supercluster's overall direction;
+            # rejects superclusters the event merely crosses perpendicularly and breaks ties (within 10 degrees) by
+            # 'penetration_span', again without needing MD trajectories or AQUA-DUCT traces
             # 'exact_matching' - matching of actual ligand transport event (all atoms from MD simulation) and real
             # tunnels existing in a given simulation during the event occurrence
+            # 'trace_matching' - like 'exact_matching' but uses the AQUA-DUCT per-frame trace of the event instead of
+            # the MD trajectory, so it needs no source trajectories (only the per-snapshot CAVER tunnels)
+            # for both matching methods, when no discriminating signal is available (no tunnels exist in the event's
+            # frames, or tunnels exist but the ligand is never inside any of them) the assignment is resolved by
+            # 'directionality' over the buried candidates rather than demoting the event to an outlier - a buried,
+            # directionally-aligned event is never turned into an outlier by the resolution step
             # 'assign2all' - assign event to all superclusters in which it is buried
 
             # Additional filters applied on superclusters after event assignment (-1 => inactive filter)
@@ -286,7 +303,10 @@ class AnalysisConfig:
             "perform_exact_matching_analysis": False,
             "folder_pattern4exact_matching_analysis": "*",  # exact_matching_analysis is performed only for folders
             # matching this pattern
+            "perform_trace_matching_analysis": False,  # like perform_exact_matching_analysis but trajectory-free,
+            # using the AQUA-DUCT per-frame trace; runs for all assigned events and writes per-event detail output
             "perform_comparative_analysis": False,
+            "interpolate_missing_snapshots4matching": False, # enables matching to ligand/trace nearest existing snapshot analyzed by Caver
             "visualize_comparative_super_cluster_volumes": False,
             "comparative_groups_definition": None,
             # Format of group definition: group_name1: [folder1, folder2, ...]; group_name2: [folder1, folder2, ...]...
@@ -302,7 +322,22 @@ class AnalysisConfig:
             "log_level": "info",
             "std_level": "info",
             "msms": None,  # path to binary of  https://ccsb.scripps.edu/msms/ program for faster volume visulaization
-            "max_events_per_cluster4visualization": 1000
+            "max_events_per_cluster4visualization": 1000,
+            # When on (default), transport-event paths are written as one bundled CGO per (supercluster, scope)
+            # holding only the subsampled events, instead of one CGO file per event. Set False for the legacy
+            # one-file-per-event layout.
+            "bundle_events_visualization": True,
+
+            # Tuning of tunnel-profile pruning (used when 'prune_tunnels = True')
+            "prune_tunnels_bin_size": 0.5,  # width of distance bins [A] for the joint-transition score
+            "prune_tunnels_survival_perc_low": 0.1,  # lower percentile of per-tunnel max distances for valid cut region
+            "prune_tunnels_survival_perc_high": 0.9,  # upper percentile of per-tunnel max distances for valid cut region
+            "prune_tunnels_core_fraction_low": 0.3,  # start of the tunnel core region as fraction of the distance range
+            "prune_tunnels_core_fraction_high": 0.6,  # end of the tunnel core region as fraction of the distance range
+            "prune_tunnels_min_joint_threshold": 0.01,  # absolute noise floor of the joint score in 'first' mode, on top of the adaptive core-derived threshold (0 disables)
+            "prune_tunnels_eff_thresh": 0.5,  # path-efficiency threshold below which a post-cut segment is 'curved'
+            "prune_tunnels_slope_percentile": 90,  # percentile of cluster core-expansion slopes used as inflation reference
+            "prune_tunnels_water_radius": 1.4  # minimum radius [A] of the last kept sphere (water transport floor)
         }
         self.advanced_settings_defaults = self.advanced_settings.copy()
 
@@ -375,9 +410,11 @@ class AnalysisConfig:
             "calculate_exact_path_distances",
             "use_cluster_spread",
             "perform_exact_matching_analysis",
+            "perform_trace_matching_analysis",
             "verbose_logging",
             "overwrite",
             "perform_comparative_analysis",
+            "interpolate_missing_snapshots4matching",
             "save_super_cluster_profiles_csvs",
             "save_distance_matrix_csv",
             "visualize_super_cluster_volumes",
@@ -386,10 +423,12 @@ class AnalysisConfig:
             "visualize_transformed_transport_events",
             "visualize_layered_clusters",
             "visualize_layered_events",
+            "bundle_events_visualization",
             "visualize_exact_matching_outcomes",
             "legacy_pymol_support",
             "aquaduct_allow_empty_folders",
             "slurm_keep_shard_results",
+            "prune_tunnels",
         ]
 
         self.integer_params = [
@@ -399,6 +438,7 @@ class AnalysisConfig:
             "worker_task_timeout_s",
             "snapshots_per_simulation",
             "caver_traj_offset",
+            "caver_snapshot_stride",
             "snapshot_id_position",
             "relevant_tunnel_cluster_min_size",
             "min_sims_num",
@@ -447,7 +487,16 @@ class AnalysisConfig:
             "tunnel_properties_quantile",
             "directional_cutoff",
             "aqauduct_ligand_effective_radius",
-            "slurm_mem_gb"
+            "slurm_mem_gb",
+            "prune_tunnels_bin_size",
+            "prune_tunnels_survival_perc_low",
+            "prune_tunnels_survival_perc_high",
+            "prune_tunnels_core_fraction_low",
+            "prune_tunnels_core_fraction_high",
+            "prune_tunnels_min_joint_threshold",
+            "prune_tunnels_eff_thresh",
+            "prune_tunnels_slope_percentile",
+            "prune_tunnels_water_radius"
         ]
 
         # parameters whose value is a list of strings, one per (non-empty) line in the INI file
@@ -711,6 +760,7 @@ class AnalysisConfig:
             "super_cluster_details_folder": os.path.join(data_folder, "super_clusters", "details"),
             "super_cluster_bottleneck_folder": os.path.join(data_folder, "super_clusters", "bottlenecks"),
             "exact_matching_details_folder": os.path.join(data_folder, "exact_matching_analysis"),
+            "trace_matching_details_folder": os.path.join(data_folder, "trace_matching_analysis"),
 
             # folder structure for visualization
             "orig_caver_vis_path": os.path.join(vis_folder, "sources", network_data_foldername, caver_foldername),
@@ -993,7 +1043,8 @@ class AnalysisConfig:
                                      "them from slurm_additional_parameters and use the "
                                      "dedicated knob instead.".format(lines))
 
-        ambiguous_assignment_resolution_methods = ["exact_matching", "penetration_depth", "assign2all"]
+        ambiguous_assignment_resolution_methods = ["exact_matching", "trace_matching", "penetration_depth",
+                                                   "penetration_span", "directionality", "assign2all"]
         if self.parameters["ambiguous_event_assignment_resolution"] not in ambiguous_assignment_resolution_methods:
             raise ValueError("\nUnsupported method for resolution of ambiguous assignments '{}' specified in "
                              "'ambiguous_event_assignment_resolution' parameter.\n Valid options are "
@@ -1007,11 +1058,36 @@ class AnalysisConfig:
         self._test_parameter_sanity("layer_thickness", 0.9, sys.maxsize)
         self._test_parameter_sanity("snapshots_per_simulation", 1, sys.maxsize)
         self._test_parameter_sanity("caver_traj_offset", 0, 1)
+        self._test_parameter_sanity("caver_snapshot_stride", 1, sys.maxsize)
         self._test_parameter_sanity("snapshot_id_position", 0, sys.maxsize)
         self._test_parameter_sanity("relevant_tunnel_cluster_min_size", 1, sys.maxsize)
         self._test_parameter_sanity("relevant_tunnel_min_radius", 0, sys.maxsize)
         self._test_parameter_sanity("relevant_tunnel_min_length", 0, sys.maxsize)
         self._test_parameter_sanity("relevant_tunnel_max_curvature", 1, sys.maxsize)
+
+        # tunnel-profile pruning knobs are only meaningful when pruning is enabled
+        if self.parameters["prune_tunnels"]:
+            valid_prune_modes = ("first", "peak")
+            if self.parameters["prune_tunnels_mode"] not in valid_prune_modes:
+                raise ValueError("\nUnsupported value '{}' for 'prune_tunnels_mode' parameter.\n Valid options are "
+                                 "'{}'.".format(self.parameters["prune_tunnels_mode"], valid_prune_modes))
+            self._test_parameter_sanity("prune_tunnels_bin_size", 0.1, sys.maxsize)
+            self._test_parameter_sanity("prune_tunnels_survival_perc_low", 0, 1)
+            self._test_parameter_sanity("prune_tunnels_survival_perc_high", 0, 1)
+            if self.parameters["prune_tunnels_survival_perc_low"] >= \
+                    self.parameters["prune_tunnels_survival_perc_high"]:
+                raise ValueError("\nParameter 'prune_tunnels_survival_perc_low' must be smaller than "
+                                 "'prune_tunnels_survival_perc_high'.")
+            self._test_parameter_sanity("prune_tunnels_core_fraction_low", 0, 1)
+            self._test_parameter_sanity("prune_tunnels_core_fraction_high", 0, 1)
+            if self.parameters["prune_tunnels_core_fraction_low"] >= \
+                    self.parameters["prune_tunnels_core_fraction_high"]:
+                raise ValueError("\nParameter 'prune_tunnels_core_fraction_low' must be smaller than "
+                                 "'prune_tunnels_core_fraction_high'.")
+            self._test_parameter_sanity("prune_tunnels_min_joint_threshold", 0, sys.maxsize)
+            self._test_parameter_sanity("prune_tunnels_eff_thresh", 0, 1)
+            self._test_parameter_sanity("prune_tunnels_slope_percentile", 1, 100)
+            self._test_parameter_sanity("prune_tunnels_water_radius", 0, sys.maxsize)
         self._test_parameter_sanity("clustering_cutoff", 0, sys.maxsize)
         self._test_parameter_sanity("event_min_distance", 0, sys.maxsize)
         self._test_parameter_sanity("event_assignment_cutoff", 0, 1)
@@ -1218,10 +1294,70 @@ class AnalysisConfig:
                 if missing_file_reports:
                     raise FileNotFoundError(missing_file_reports)
 
+                self._validate_caver_snapshot_stride(aquaduct_paths)
+
         if self.parameters["visualize_comparative_super_cluster_volumes"]:
             if not self.parameters["visualize_super_cluster_volumes"]:
                 raise ValueError("\nWhen 'visualize_comparative_super_cluster_volumes' parameter is enabled, "
                                  "'visualize_super_cluster_volumes' must be enabled too.")
+
+    def _validate_caver_snapshot_stride(self, aquaduct_paths: dict):
+        """
+        Cross-check caver_snapshot_stride against the AQUA-DUCT analyzed frame window. The N CAVER
+        snapshots (snapshots_per_simulation) sampled at the configured stride should span roughly the
+        analyzed frame window (num * stride ~ window length); if they do not, the event<->snapshot mapping
+        used by exact/trace matching would be wrong. Raises when a stride-dependent role is active
+        (matching, or matching-based ambiguous resolution), otherwise only warns so a dormant mismatch
+        never blocks a run that does not use the mapping. Cheap: reads the small summary of a single
+        simulation (the window is uniform across them).
+        :param aquaduct_paths: mapping of root path -> list of AQUA-DUCT md_labels found under it
+        """
+
+        num = self.parameters.get("snapshots_per_simulation")
+        if not num:  # not known yet (relies on later auto-detection); the stage-2 check is the backstop
+            return
+
+        summary_pattern = self.parameters["aquaduct_results_relative_summaryfile"]
+        summary_file = None
+        for root_path, md_labels in aquaduct_paths.items():
+            for md_label in md_labels:
+                try:
+                    summary_file = get_filepath(os.path.join(root_path, md_label), summary_pattern)
+                except RuntimeError:
+                    continue
+                break
+            if summary_file is not None:
+                break
+        if summary_file is None:
+            return
+
+        with open(summary_file) as in_stream:
+            event_domain_length = parse_aquaduct_frames_window(in_stream.readlines())
+        if event_domain_length is None:  # older AQUA-DUCT output without the window line
+            logger.debug("AQUA-DUCT summary %s has no 'Frames window' line; cannot validate "
+                         "'caver_snapshot_stride'.", summary_file)
+            return
+
+        config_stride = self.parameters.get("caver_snapshot_stride") or 1
+        # the configured stride is consistent if N snapshots at that stride span the analyzed window to
+        # within one stride (the slack absorbs an off-by-one frame count or a dropped partial last window)
+        if abs(event_domain_length - num * config_stride) < config_stride:
+            return
+
+        expected_stride = max(1, round(event_domain_length / num))
+        needs_map = (self.parameters.get("perform_exact_matching_analysis")
+                     or self.parameters.get("perform_trace_matching_analysis")
+                     or self.parameters.get("ambiguous_event_assignment_resolution") in ("exact_matching",
+                                                                                          "trace_matching"))
+        message = ("AQUA-DUCT analyzed {} frames for {} CAVER snapshots, implying a sampling stride of "
+                   "~{}, but 'caver_snapshot_stride' is {}.".format(event_domain_length, num,
+                                                                    expected_stride, config_stride))
+        if needs_map:
+            raise ValueError("\n" + message + " Event matching (or matching-based ambiguous resolution) "
+                             "relies on this mapping, so set 'caver_snapshot_stride' to {} to match the "
+                             "data.".format(expected_stride))
+        logger.warning("%s It does not affect this run (no event matching uses the mapping), but set "
+                       "'caver_snapshot_stride' to %d if you enable matching.", message, expected_stride)
 
     def _detect_set_pdb_reference_structure(self):
         """
@@ -1666,6 +1802,7 @@ class AnalysisConfig:
             "aquaduct_results_path": "# AQUA-DUCT results",
             "trajectory_path": "# Source MD trajectories",
             "snapshots_per_simulation": "# Parsing of tunnel clusters from CAVER results",
+            "prune_tunnels": "# Pruning of tunnel profiles extending into empty solvent space",
             "relevant_tunnel_cluster_min_size": "# Filtreing of tunnels and clusters before layering",
             "clustering_method": "# Clustering of tunnel clusters into superclusters - global and agglomerative settings",
             "hdbscan_min_cluster_size": "# HDBscan clustering settings",
@@ -1679,7 +1816,8 @@ class AnalysisConfig:
             "save_super_cluster_profiles_csvs": "# Optional data generation",
             "visualize_super_cluster_volumes": "# Optional visualization",
             "random_seed": "# Calculations",
-            "visualize_exact_matching_outcomes": "# Finer control of outputs & logging"
+            "visualize_exact_matching_outcomes": "# Finer control of outputs & logging",
+            "prune_tunnels_bin_size": "# Tuning of tunnel-profile pruning (used when 'prune_tunnels = True')"
         }
 
         with open(filepath, "w") as out_stream:

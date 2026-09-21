@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 # TransportTools, a library for massive analyses of internal voids in biomolecules and ligand transport through them
-# Copyright (C) 2022  Jan Brezovsky <janbre@amu.edu.pl>
+# Copyright (C) 2021 The TransportTools Authors
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -355,46 +355,68 @@ class TestOutlierTransportEvents(unittest.TestCase):
 
     def test_prepare_visualization_returns_list(self):
         """
-        Verify prepare_visualization() returns a list of strings
+        Verify prepare_visualization() returns (script lines, bundle request)
         """
         # Add some events
         self.outliers.add_transport_event("md1", "path_001", "entry", sample_traced_event_1)
 
-        vis_lines = self.outliers.prepare_visualization("overall")
+        vis_lines, bundle_request = self.outliers.prepare_visualization("overall")
 
         self.assertIsInstance(vis_lines, list)
-        # Should have lines if events exist
+        # Should have lines and a bundle request if events exist
         if self.outliers.exist("overall"):
             self.assertGreater(len(vis_lines), 0)
             for line in vis_lines:
                 self.assertIsInstance(line, str)
+            self.assertIsNotNone(bundle_request)
+            bundle_basename, selection = bundle_request
+            self.assertEqual(bundle_basename, "outliers_overall_events.dump.gz")
+            self.assertGreater(len(selection), 0)
 
     def test_prepare_visualization_empty_when_no_events(self):
         """
-        Verify prepare_visualization() returns empty list when no events exist
+        Verify prepare_visualization() returns empty list and no bundle when no events exist
         """
-        vis_lines = self.outliers.prepare_visualization("overall")
+        vis_lines, bundle_request = self.outliers.prepare_visualization("overall")
 
         self.assertIsInstance(vis_lines, list)
         self.assertEqual(len(vis_lines), 0)
+        self.assertIsNone(bundle_request)
 
     def test_prepare_visualization_contains_expected_patterns(self):
         """
-        Verify prepare_visualization() generates correct PyMOL commands
+        Verify prepare_visualization() generates correct bundle-loading PyMOL commands
         """
         # Add events
         self.outliers.add_transport_event("md1", "path_001", "entry", sample_traced_event_1)
         self.outliers.add_transport_event("md1", "path_003", "release", sample_traced_event_3)
 
-        vis_lines = self.outliers.prepare_visualization("overall")
+        vis_lines, _ = self.outliers.prepare_visualization("overall")
 
         # Join all lines to check for patterns
         all_content = "\n".join(vis_lines)
 
-        # Check for key patterns
+        # Check for key bundle-mode patterns: a single bundle load + runtime iteration over its groups
+        self.assertIn("outliers_overall_events.dump.gz", all_content)
+        self.assertIn("outlier_events = pickle.load(in_stream)", all_content)
+        self.assertIn("for (event_type, resname), event_cgo in outlier_events.items():", all_content)
+        self.assertIn("cmd.load_cgo(event_cgo, obj_name)", all_content)
+
+    def test_prepare_visualization_legacy_mode_per_event_files(self):
+        """
+        With bundle_events_visualization off, the legacy one-file-per-event script is generated
+        """
+        self.outliers.parameters = dict(self.test_params)
+        self.outliers.parameters["bundle_events_visualization"] = False
+        self.outliers.add_transport_event("md1", "path_001", "entry", sample_traced_event_1)
+        self.outliers.add_transport_event("md1", "path_003", "release", sample_traced_event_3)
+
+        vis_lines, bundle_request = self.outliers.prepare_visualization("overall")
+        all_content = "\n".join(vis_lines)
+
+        self.assertIsNone(bundle_request)
         self.assertIn("events = [", all_content)
         self.assertIn("for event in events:", all_content)
-        self.assertIn("pickle.load(in_stream)", all_content)
         self.assertIn("cmd.load_cgo(path,", all_content)
 
     def test_prepare_visualization_md_specific(self):
@@ -406,7 +428,7 @@ class TestOutlierTransportEvents(unittest.TestCase):
         self.outliers.add_transport_event("md2", "path_002", "entry", sample_traced_event_2)
 
         # Get md1-specific visualization
-        vis_lines_md1 = self.outliers.prepare_visualization("md1")
+        vis_lines_md1, _ = self.outliers.prepare_visualization("md1")
 
         self.assertIsInstance(vis_lines_md1, list)
         # Should have content if events exist for md1
@@ -578,54 +600,57 @@ class TestOutlierTransportEventsPerResidue(unittest.TestCase):
         self.assertIn("WAT: entry=2, release=0", content)
         self.assertIn("U01: entry=0, release=1", content)
 
-    def test_report_summary_line_with_residue_names_appends_pairs(self):
-        """Passing residue_names must append entry/release columns for each residue."""
+    def test_report_summary_line_with_residue_names_appends_quadruples(self):
+        """Passing residue_names appends a mean/stdev quadruple (E_avg, E_std, R_avg, R_std) per residue."""
         self.outliers.add_transport_event("md1", "p1", "entry", ("WAT:123", (10, 50)))
         self.outliers.add_transport_event("md1", "p2", "release", ("U01:55", (20, 60)))
-        # widths: 4 base + 2 per residue = 8 entries
-        widths = [50, 10, 10, 10, 5, 5, 5, 5]
+        # widths: 4 base + 4 per residue = 12 entries
+        widths = [50, 10, 10, 10, 5, 5, 5, 5, 5, 5, 5, 5]
         line = self.outliers.report_summary_line(widths, "overall",
-                                                  residue_names=["U01", "WAT"])
+                                                  residue_names=["U01", "WAT"],
+                                                  sims2process=["md1"])
         # Strip trailing newline before counting columns
         line_stripped = line.rstrip("\n")
-        # Comma-separated values part: 'Total ... events: 2, 1, 1, 0, 1, 1, 0'
         parts = [p.strip() for p in line_stripped.split(",")]
-        # parts[0] is the header text + first value: "Total number of unassigned events:         2"
-        # parts[1..]: remaining values
-        # Expect: total=2, entry=1, release=1, U01_E=0, U01_R=1, WAT_E=1, WAT_R=0
-        # Last 4 values are the per-residue columns
-        self.assertEqual(parts[-4], "0")  # U01 entry
-        self.assertEqual(parts[-3], "1")  # U01 release
-        self.assertEqual(parts[-2], "1")  # WAT entry
-        self.assertEqual(parts[-1], "0")  # WAT release
+        # parts[0] is the header text + total; then entry, release, then the two per-residue quadruples.
+        # Single simulation -> avg == count, std == 0. Order follows residue_names: U01 then WAT.
+        # U01: entry=0, release=1  ->  0.0, 0.0, 1.0, 0.0
+        # WAT: entry=1, release=0  ->  1.0, 0.0, 0.0, 0.0
+        self.assertEqual(parts[-8:], ["0.0", "0.0", "1.0", "0.0", "1.0", "0.0", "0.0", "0.0"])
 
     def test_report_summary_line_absent_residue_uses_dash(self):
-        """A residue listed in residue_names but with no events must render as '-'"""
+        """A residue listed in residue_names but with no events must render all 4 columns as '-'"""
         self.outliers.add_transport_event("md1", "p1", "entry", ("WAT:123", (10, 50)))
-        widths = [50, 10, 10, 10, 5, 5, 5, 5]
+        widths = [50, 10, 10, 10, 5, 5, 5, 5, 5, 5, 5, 5]
         line = self.outliers.report_summary_line(widths, "overall",
-                                                  residue_names=["U01", "WAT"])
+                                                  residue_names=["U01", "WAT"],
+                                                  sims2process=["md1"])
         line_stripped = line.rstrip("\n")
         parts = [p.strip() for p in line_stripped.split(",")]
-        # U01 absent -> dashes; WAT present -> 1, 0
-        self.assertEqual(parts[-4], "-")
-        self.assertEqual(parts[-3], "-")
-        self.assertEqual(parts[-2], "1")
-        self.assertEqual(parts[-1], "0")
+        # U01 absent -> 4 dashes; WAT present (entry=1, release=0) -> 1.0, 0.0, 0.0, 0.0
+        self.assertEqual(parts[-8:], ["-", "-", "-", "-", "1.0", "0.0", "0.0", "0.0"])
 
     def test_prepare_visualization_obj_name_per_residue_pattern(self):
-        """Object name format changed from '{event_type}_outlier' to
-        '{resname_lower}_{event_type}_outlier' to support multi-residue visualization."""
+        """Per-residue object names are built at PyMOL runtime from the bundle's (event_type, resname)
+        keys as '{resname_lower}_{event_type}_outlier'; the deterministic per-residue identity is carried
+        by the returned bundle selection (entity_key + (event_type, resname) group)."""
         self.outliers.add_transport_event("md1", "p1", "entry", ("WAT:123", (10, 50)))
         self.outliers.add_transport_event("md1", "p2", "release", ("U01:55", (20, 60)))
-        vis_lines = self.outliers.prepare_visualization("overall")
+        vis_lines, bundle_request = self.outliers.prepare_visualization("overall")
         content = "".join(vis_lines)
-        # Expect per-residue object names
-        self.assertIn("wat_entry_outlier", content)
-        self.assertIn("u01_release_outlier", content)
-        # Old generic names must no longer appear
-        self.assertNotIn("'entry_outlier'", content)
-        self.assertNotIn("'release_outlier'", content)
+
+        # Script builds the per-residue name at runtime from the bundle keys
+        self.assertIn('obj_name = "{}_{}_outlier".format(resname.lower(), event_type)', content)
+
+        # Deterministic per-residue identity lives in the returned selection
+        self.assertIsNotNone(bundle_request)
+        _, selection = bundle_request
+        entity_keys = {entry[1] for entry in selection}
+        group_keys = {entry[2] for entry in selection}
+        self.assertIn("wat_p1_entry", entity_keys)
+        self.assertIn("u01_p2_release", entity_keys)
+        self.assertIn(("entry", "WAT"), group_keys)
+        self.assertIn(("release", "U01"), group_keys)
 
 
 if __name__ == "__main__":
