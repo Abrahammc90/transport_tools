@@ -42,11 +42,19 @@ if TYPE_CHECKING:  # to enable type_checking without cyclic imports
 # the compiled CPU distance kernel (transport_tools/libs/_distance_kernel.c) is an optional
 # C extension built by setup.py; it is not guaranteed to be present (e.g. no compiler at
 # install time), so callers must fall back to the pure-Python path when this is None -
-# see calc_distance_batch_compiled() and calc_distance_chunk() below
-try:
-    from transport_tools.libs import _distance_kernel as _COMPILED_DISTANCE_KERNEL
-except (ImportError, OSError):
+# see calc_distance_batch_compiled() and calc_distance_chunk() below. Also force-disabled via
+# TRANSPORT_TOOLS_DISABLE_COMPILED_KERNEL (any non-empty value) so the pure-Python/NumPy path
+# (LayeredPathSet.avg_distance2path_set) can be benchmarked against the compiled/CUDA backends on
+# demand - this is read at import time so it is inherited by the 'local' backend's spawned
+# multiprocessing workers too (each is a fresh interpreter that re-imports this module, unlike an
+# in-process monkeypatch of _COMPILED_DISTANCE_KERNEL, which spawned workers would never see).
+if os.environ.get("TRANSPORT_TOOLS_DISABLE_COMPILED_KERNEL"):
     _COMPILED_DISTANCE_KERNEL = None
+else:
+    try:
+        from transport_tools.libs import _distance_kernel as _COMPILED_DISTANCE_KERNEL
+    except (ImportError, OSError):
+        _COMPILED_DISTANCE_KERNEL = None
 
 logger = getLogger(__name__)
 
@@ -2338,6 +2346,54 @@ def vector_angle(v1: np.ndarray, v2: np.ndarray) -> float:
     return np.arctan2(sinang, cosang)
 
 
+def _classify_pairs(index_pairs: List[Tuple[int, int]],
+                    path_sets: Mapping[Tuple[str, int], LayeredPathSet],
+                    cluster_specifications: List[Tuple[str, int]]) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Vectorized exact/misaligned classification shared by calc_distance_batch_compiled and
+    calc_distance_batch_kernel: 'exact' pairs always get the full distance calculation; non-exact
+    pairs whose direction vectors point too far apart (relative to directional_cutoff) are flagged
+    'misaligned' so the compiled/CUDA kernels can short-circuit them to the cutoff sentinel (999.0)
+    without walking their node pairs at all.
+
+    Every cluster's direction vector and per-cluster parameters are computed once here - each
+    cluster appears in up to len(cluster_specifications) - 1 pairs, and LayeredPathSet._get_direction()
+    is not cached (it recomputes an np.average over the cluster's terminal nodes every call) - then
+    combined pairwise with vectorized NumPy (einsum/cross over all pairs at once) instead of one
+    Python-level vector_angle() call per pair.
+    :param index_pairs: (cls1, cls2) order-ID pairs (indices into cluster_specifications) to classify
+    :param path_sets: sets of representative paths for all clusters, keyed by cluster specification
+    :param cluster_specifications: definition of clusters, indexed by their order ID
+    :return: (exact_pairs, misaligned_pairs), each a uint8 ndarray of length len(index_pairs)
+    """
+
+    num_clusters = len(cluster_specifications)
+    directions = np.empty((num_clusters, 3), dtype=np.float64)
+    exact_flags = np.empty(num_clusters, dtype=bool)
+    directional_cutoffs = np.empty(num_clusters, dtype=np.float64)
+    for cluster_id, specification in enumerate(cluster_specifications):
+        path_set = path_sets[specification]
+        directions[cluster_id] = path_set._get_direction()
+        exact_flags[cluster_id] = bool(path_set.parameters["calculate_exact_path_distances"])
+        directional_cutoffs[cluster_id] = path_set.parameters["directional_cutoff"]
+
+    pairs = np.asarray(index_pairs, dtype=np.int64)
+    cls1, cls2 = pairs[:, 0], pairs[:, 1]
+
+    # vectorized vector_angle(): angle = atan2(|v1 x v2|, v1 . v2), evaluated for every pair at once
+    v1 = directions[cls1]
+    v2 = directions[cls2]
+    cos_component = np.einsum("ij,ij->i", v1, v2)
+    sin_component = np.linalg.norm(np.cross(v1, v2), axis=1)
+    angle = np.arctan2(sin_component, cos_component)
+
+    exact_pairs = exact_flags[cls1]
+    directional_cutoff = directional_cutoffs[cls1]
+    misaligned_pairs = ~exact_pairs & (directional_cutoff <= angle) & (angle <= 2 * np.pi - directional_cutoff)
+
+    return exact_pairs.astype(np.uint8), misaligned_pairs.astype(np.uint8)
+
+
 def einsum_dist(xyz1: np.ndarray, xyz2: np.ndarray):
     """
     Calculates distance between two points in computationally rather efficient manner
@@ -2487,22 +2543,7 @@ def calc_distance_batch_compiled(index_pairs: List[Tuple[int, int]],
     if prepared_path_sets is None:
         prepared_path_sets = _prepare_compiled_path_sets(path_sets, cluster_specifications)
 
-    exact_pairs = np.empty(len(index_pairs), dtype=np.uint8)
-    misaligned_pairs = np.empty(len(index_pairs), dtype=np.uint8)
-    for pair_id, (cls1, cls2) in enumerate(index_pairs):
-        path_set1 = path_sets[cluster_specifications[cls1]]
-        path_set2 = path_sets[cluster_specifications[cls2]]
-        # 'exact' pairs always get the full distance calculation; non-exact pairs whose
-        # direction vectors point too far apart (relative to directional_cutoff) are flagged
-        # 'misaligned' so the kernel can short-circuit them to the cutoff sentinel (999.0)
-        # without walking their node pairs at all
-        exact_pairs[pair_id] = bool(path_set1.parameters["calculate_exact_path_distances"])
-        angle = vector_angle(path_set1._get_direction(), path_set2._get_direction())
-        directional_cutoff = path_set1.parameters["directional_cutoff"]
-        misaligned_pairs[pair_id] = (
-            not exact_pairs[pair_id]
-            and directional_cutoff <= angle <= 2 * np.pi - directional_cutoff
-        )
+    exact_pairs, misaligned_pairs = _classify_pairs(index_pairs, path_sets, cluster_specifications)
 
     cluster_pairs = np.ascontiguousarray(index_pairs, dtype=np.int64)
     distances = np.empty(len(index_pairs), dtype=np.float64)
@@ -2531,17 +2572,25 @@ def calc_distance_batch_compiled(index_pairs: List[Tuple[int, int]],
 
 
 def _prepare_kernel_path_sets(path_sets: Mapping[Tuple[str, int], LayeredPathSet],
-                              cluster_specifications: List[Tuple[str, int]], cp):
+                              cluster_specifications: List[Tuple[str, int]], cp, cuda_dtype):
     """
     Re-derive _prepare_compiled_path_sets()'s per-path/per-prefix layout into a flat, per-effective-
     path layout, then upload everything to the GPU as CuPy arrays. Unlike the compiled CPU kernel
     (which walks path -> prefix nested ranges itself in C), the GPU kernels are handed one flat
     array of effective paths directly, since _prepare_kernel_path_pair_tasks() below needs to
     enumerate every (effective_path_a, effective_path_b) combination on the host before the launch.
+
+    All floating-point arrays (nodes, last_layers, first_terminal_layers) are cast to cuda_dtype
+    before upload - they must match the dtype the selected CUDA kernel was compiled for (see
+    _cuda_distance_kernel.get_jit_distance_kernels), which is float32 by default here. The shared
+    _prepare_compiled_path_sets() they are derived from always stays float64 (the CPU compiled
+    kernel and pure-Python reference paths need full precision), so this cast is local to the CUDA
+    path only and never affects the CPU backend.
     :param path_sets: sets of representative paths for all clusters, keyed by cluster specification
     :param cluster_specifications: order in which clusters are packed (defines all returned indices)
     :param cp: the imported cupy module (passed in rather than imported here, so this stays
               importable in environments without CuPy - see calc_distance_batch_kernel)
+    :param cuda_dtype: NumPy floating dtype (np.float32 or np.float64) the target CUDA kernel expects
     :return: (nodes, path_nodes, effective_path_offsets, effective_path_lengths,
              cluster_effective_offsets, last_layers, first_terminal_layers), all as CuPy arrays
              except cluster_effective_offsets (kept on the host - it only drives task enumeration)
@@ -2566,13 +2615,13 @@ def _prepare_kernel_path_sets(path_sets: Mapping[Tuple[str, int], LayeredPathSet
     cluster_effective_offsets = np.ascontiguousarray(cluster_effective_offsets, dtype=np.int64)
 
     return (
-        cp.asarray(nodes).ravel(),
+        cp.asarray(nodes.astype(cuda_dtype, copy=False)).ravel(),
         cp.asarray(path_nodes),
         cp.asarray(effective_path_offsets, dtype=cp.int64),
         cp.asarray(effective_path_lengths, dtype=cp.int64),
         cluster_effective_offsets,
-        cp.asarray(last_layers),
-        cp.asarray(first_terminal_layers),
+        cp.asarray(last_layers.astype(cuda_dtype, copy=False)),
+        cp.asarray(first_terminal_layers.astype(cuda_dtype, copy=False)),
     )
 
 
@@ -2586,6 +2635,13 @@ def _prepare_kernel_path_pair_tasks(index_pairs: List[Tuple[int, int]],
     _cuda_distance_rawkernel.py). Misaligned pairs (see calc_distance_batch_compiled) contribute
     zero tasks - they are short-circuited straight to the cutoff sentinel by
     finalize_cluster_pair_distances instead of being evaluated node by node.
+
+    Vectorized cartesian-product construction (a ragged/jagged product - each pair contributes a
+    different len_a * len_b task count) instead of a Python-level nested loop: pair_id_per_task
+    repeats each pair's own index once per task it owns (np.repeat with per-pair task_counts), which
+    turns "for every task, which pair does it belong to and what is its position within that pair's
+    len_a x len_b block" into three vectorized NumPy expressions evaluated once over all tasks at
+    once, rather than len_a * len_b individual Python .append() calls per pair.
     :param index_pairs: (cls1, cls2) order-ID pairs (indices into cluster_specifications) to evaluate
     :param cluster_effective_offsets: from _prepare_kernel_path_sets(); effective-path index range
                                       owned by each cluster
@@ -2595,29 +2651,31 @@ def _prepare_kernel_path_pair_tasks(index_pairs: List[Tuple[int, int]],
              the finalize kernel knows which tasks to average per cluster pair.
     """
 
-    task_effective_a = list()
-    task_effective_b = list()
-    task_cluster_a = list()
-    task_cluster_b = list()
-    pair_task_offsets = [0]
+    pairs = np.asarray(index_pairs, dtype=np.int64)
+    cluster_a_arr = pairs[:, 0]
+    cluster_b_arr = pairs[:, 1]
+    offsets = np.asarray(cluster_effective_offsets, dtype=np.int64)
+    start_a = offsets[cluster_a_arr]
+    start_b = offsets[cluster_b_arr]
+    len_a = offsets[cluster_a_arr + 1] - start_a
+    len_b = offsets[cluster_b_arr + 1] - start_b
 
-    for pair_id, (cluster_a, cluster_b) in enumerate(index_pairs):
-        if not bool(misaligned_pairs[pair_id]):
-            start_a = cluster_effective_offsets[cluster_a]
-            end_a = cluster_effective_offsets[cluster_a + 1]
-            start_b = cluster_effective_offsets[cluster_b]
-            end_b = cluster_effective_offsets[cluster_b + 1]
+    # cartesian product: every effective path of cluster_a against every effective path of
+    # cluster_b becomes its own task (its own CUDA block at launch time); misaligned pairs
+    # contribute zero tasks, same as the reference loop
+    task_counts = np.where(misaligned_pairs.astype(bool), 0, len_a * len_b)
+    pair_task_offsets = np.empty(len(index_pairs) + 1, dtype=np.int64)
+    pair_task_offsets[0] = 0
+    np.cumsum(task_counts, out=pair_task_offsets[1:])
+    total_tasks = int(pair_task_offsets[-1])
 
-            # cartesian product: every effective path of cluster_a against every effective path
-            # of cluster_b becomes its own task (its own CUDA block at launch time)
-            for effective_path_a in range(start_a, end_a):
-                for effective_path_b in range(start_b, end_b):
-                    task_effective_a.append(effective_path_a)
-                    task_effective_b.append(effective_path_b)
-                    task_cluster_a.append(cluster_a)
-                    task_cluster_b.append(cluster_b)
-
-        pair_task_offsets.append(len(task_effective_a))
+    pair_id_per_task = np.repeat(np.arange(len(index_pairs), dtype=np.int64), task_counts)
+    within_pair_task_idx = np.arange(total_tasks, dtype=np.int64) - pair_task_offsets[pair_id_per_task]
+    local_len_b = len_b[pair_id_per_task]
+    task_effective_a = start_a[pair_id_per_task] + within_pair_task_idx // local_len_b
+    task_effective_b = start_b[pair_id_per_task] + within_pair_task_idx % local_len_b
+    task_cluster_a = cluster_a_arr[pair_id_per_task]
+    task_cluster_b = cluster_b_arr[pair_id_per_task]
 
     return (
         np.ascontiguousarray(task_effective_a, dtype=np.int64),
@@ -2676,42 +2734,85 @@ def _select_cuda_threads_for_work(cp, work_items: int) -> int:
     return max(warp_size, threads)
 
 
-def _select_cuda_path_threads_per_block(cp, effective_path_lengths, task_effective_a: np.ndarray,
-                                        task_effective_b: np.ndarray) -> int:
+def _next_power_of_two_array(values: np.ndarray) -> np.ndarray:
     """
-    Size the path_pair_node_distances launch from the single largest task in the batch: each CUDA
-    block (one task = one effective-path pair) walks length_a + length_b nodes total, striding its
-    threads across them, so the block needs at least that many threads to cover the biggest task
-    in one pass (see _select_cuda_threads_for_work).
-    """
-
-    lengths = cp.asnumpy(effective_path_lengths)
-    if task_effective_a.size:
-        total_length = int(np.max(lengths[task_effective_a] + lengths[task_effective_b]))
-    else:
-        total_length = 1
-    return _select_cuda_threads_for_work(cp, total_length)
-
-
-def _select_cuda_finalize_threads_per_block(cp, pair_task_offsets: np.ndarray) -> int:
-    """
-    Size the finalize_cluster_pair_distances launch from the cluster pair with the most tasks to
-    average: each CUDA block (one cluster pair) strides its threads across that pair's task_values.
+    Vectorized ndarray equivalent of _next_power_of_two() for values >= 1: the smallest power of
+    two >= each element, computed with an integer bit-smear (a value is OR'd with right-shifted
+    copies of itself until every bit below its highest set bit is 1, then +1 rounds up to the next
+    power of two) instead of np.log2/np.ceil. This avoids a real floating-point rounding risk here:
+    log2 of an exact power of two can land a hair above its true integer value (e.g. log2(4) as
+    2.0000000000000004), which ceil() would then round up to the *next* power of two instead of
+    returning it unchanged - and bucket boundaries below (warp_size, the device's max threads/block)
+    are themselves powers of two that whole buckets of tasks legitimately clip to.
     """
 
-    return _select_cuda_threads_for_work(cp, int(np.max(np.diff(pair_task_offsets), initial=1)))
+    smeared = np.maximum(values.astype(np.int64) - 1, 0)
+    for shift in (1, 2, 4, 8, 16, 32):
+        smeared |= smeared >> shift
+    return smeared + 1
 
 
-def _get_cuda_distance_kernels(cp, threads_per_block: int):
+def _bucket_by_block_size(cp, work_sizes: np.ndarray) -> List[Tuple[int, np.ndarray]]:
     """
-    Fetch the compiled/cached (path_kernel, finalize_kernel) pair for the given block size. Import
-    is deferred to call time (rather than at module load) so this module stays importable without
-    CuPy installed; _cuda_distance_kernel picks the cupyx.jit or RawKernel implementation based on
-    the TRANSPORT_TOOLS_CUDA_KERNEL environment variable (see its get_distance_kernels()).
+    Partition independent GPU work items (tasks for path_pair_node_distances, cluster pairs for
+    finalize_cluster_pair_distances) into buckets by the CUDA block size each one actually needs,
+    instead of sizing a single launch from the batch-wide maximum (the old
+    _select_cuda_path_threads_per_block / _select_cuda_finalize_threads_per_block did exactly that).
+
+    A single global block size forces every small item to pay the shared-memory allocation and
+    jit.syncthreads() reduction cost of the single largest item in the whole batch: one oversized
+    cluster paired against many small ones inflates every block in the launch, even though most of
+    them then run at a small fraction of their threads doing real work (the rest just park through
+    the reduction). calc_distance_batch_kernel instead launches one right-sized kernel call per
+    bucket, each covering only the items that actually need that block size.
+    :param cp: the imported cupy module (device property lookup only)
+    :param work_sizes: per-item independent work-unit count driving the block-size choice (a task's
+                       length_a + length_b, or a cluster pair's task count)
+    :return: (threads_per_block, item_indices) per non-empty bucket, ascending by threads_per_block;
+             item_indices is an int64 ndarray of positions into work_sizes/the caller's per-item arrays
+    """
+
+    if work_sizes.size == 0:
+        return []
+
+    try:
+        properties = cp.cuda.runtime.getDeviceProperties(0)
+    except Exception:
+        properties = {}
+    warp_size = int(properties.get("warpSize", 32))
+    max_threads_per_block = max(warp_size, int(properties.get("maxThreadsPerBlock", 256)))
+    max_power_of_two_threads = 1 << (max_threads_per_block.bit_length() - 1)
+
+    configured_threads = os.environ.get("TRANSPORT_TOOLS_CUDA_THREADS_PER_BLOCK")
+    if configured_threads:
+        # pinned block size (benchmarking/debugging): _select_cuda_threads_for_work already
+        # parses/validates it - route one call through it, then put every item in a single bucket
+        threads = _select_cuda_threads_for_work(cp, int(work_sizes.max()))
+        return [(threads, np.arange(work_sizes.size, dtype=np.int64))]
+
+    clipped = np.clip(work_sizes.astype(np.int64), warp_size, max_power_of_two_threads)
+    bucket_threads = _next_power_of_two_array(clipped)
+
+    buckets = []
+    for threads in np.unique(bucket_threads):
+        item_indices = np.flatnonzero(bucket_threads == threads)
+        buckets.append((int(threads), item_indices))
+    return buckets
+
+
+def _get_cuda_distance_kernels(cp):
+    """
+    Fetch the compiled/cached (path_kernel, finalize_kernel) pair for the currently resolved
+    precision (see _cuda_distance_kernel.resolve_cuda_precision) - one compiled pair serves every
+    CUDA block size (dynamic shared memory, sized per launch - see calc_distance_batch_kernel), so
+    unlike the block size this needs no per-call parameter. Import is deferred to call time (rather
+    than at module load) so this module stays importable without CuPy installed;
+    _cuda_distance_kernel picks the cupyx.jit or RawKernel implementation based on the
+    TRANSPORT_TOOLS_CUDA_KERNEL environment variable (see its get_distance_kernels()).
     """
 
     from transport_tools.libs import _cuda_distance_kernel
-    return _cuda_distance_kernel.get_distance_kernels(cp, threads_per_block)
+    return _cuda_distance_kernel.get_distance_kernels(cp)
 
 
 def calc_distance_batch_kernel(index_pairs: List[Tuple[int, int]],
@@ -2729,8 +2830,19 @@ def calc_distance_batch_kernel(index_pairs: List[Tuple[int, int]],
        pair's task_values into the final distance, applying the same 999.0 cutoff-sentinel and
        misaligned-pair short-circuit as the compiled CPU backend (calc_distance_batch_compiled).
 
-    Any pair the GPU could not resolve (task_invalid, surfaced back as NaN) is recomputed with the
-    exact pure-Python reference implementation, mirroring the compiled-CPU-backend fallback.
+    Both kernels are launched once per bucket (see _bucket_by_block_size) instead of once for the
+    whole batch: tasks/pairs are grouped by the CUDA block size their own workload actually needs,
+    so a single oversized task/pair can no longer force every other block in the launch to run
+    over-provisioned. Floating-point precision (nodes/task_values/output dtype and the compiled
+    kernels' internal arithmetic) is float32 by default, float64 when
+    TRANSPORT_TOOLS_CUDA_PRECISION=float64 is set - see _cuda_distance_kernel.resolve_cuda_precision.
+
+    Any pair the GPU could not resolve is recomputed with the exact pure-Python reference
+    implementation, mirroring the compiled-CPU-backend fallback. "Could not resolve" is tracked
+    without a separate invalid-flag array: path_pair_node_distances writes NaN into a task's
+    task_values entry directly when it found no valid node correspondence, which then poisons
+    finalize_cluster_pair_distances' own sum through ordinary float addition (NaN + anything = NaN)
+    - see both kernels' comments in _cuda_distance_kernel.py.
     :param index_pairs: (cls1, cls2) order-ID pairs (indices into cluster_specifications) to evaluate
     :param path_sets: sets of representative paths for all clusters, keyed by cluster specification
     :param cluster_specifications: definition of clusters, indexed by their order ID
@@ -2755,82 +2867,91 @@ def calc_distance_batch_kernel(index_pairs: List[Tuple[int, int]],
     except cp.cuda.runtime.CUDARuntimeError as error:
         raise RuntimeError("CUDA mode requested, but no usable CUDA-capable device was found") from error
 
+    from transport_tools.libs._cuda_distance_kernel import resolve_cuda_precision
+    cuda_dtype = np.float32 if resolve_cuda_precision() == "float32" else np.float64
+    cuda_itemsize = np.dtype(cuda_dtype).itemsize
+    # both kernels are compiled once for this precision (block size is a launch-time argument via
+    # dynamic shared memory, not baked into the kernel - see _get_cuda_distance_kernels), so fetch
+    # them once up front instead of once per bucket below
+    path_kernel, finalize_kernel = _get_cuda_distance_kernels(cp)
+
     # same exact/misaligned classification as calc_distance_batch_compiled - kept in sync so both
     # backends short-circuit the same pairs to the same 999.0 cutoff sentinel
-    exact_pairs = np.empty(len(index_pairs), dtype=np.uint8)
-    misaligned_pairs = np.empty(len(index_pairs), dtype=np.uint8)
-    for pair_id, (cls1, cls2) in enumerate(index_pairs):
-        path_set1 = path_sets[cluster_specifications[cls1]]
-        path_set2 = path_sets[cluster_specifications[cls2]]
-        exact_pairs[pair_id] = bool(path_set1.parameters["calculate_exact_path_distances"])
-        angle = vector_angle(path_set1._get_direction(), path_set2._get_direction())
-        directional_cutoff = path_set1.parameters["directional_cutoff"]
-        misaligned_pairs[pair_id] = (
-            not exact_pairs[pair_id]
-            and directional_cutoff <= angle <= 2 * np.pi - directional_cutoff
-        )
+    exact_pairs, misaligned_pairs = _classify_pairs(index_pairs, path_sets, cluster_specifications)
 
     nodes, path_nodes, effective_path_offsets, effective_path_lengths, cluster_effective_offsets, \
         last_layers, first_terminal_layers = \
-        _prepare_kernel_path_sets(path_sets, cluster_specifications, cp)
+        _prepare_kernel_path_sets(path_sets, cluster_specifications, cp, cuda_dtype)
     task_effective_a, task_effective_b, task_cluster_a, task_cluster_b, pair_task_offsets = \
         _prepare_kernel_path_pair_tasks(index_pairs, cluster_effective_offsets, misaligned_pairs)
 
     num_tasks = len(task_effective_a)
-    output = cp.empty(len(index_pairs), dtype=cp.float64)         # one final distance per index_pairs entry
-    task_values = cp.empty(num_tasks, dtype=cp.float64)           # per-task average node distance (kernel 1's output)
-    task_invalid = cp.empty(num_tasks, dtype=cp.int32)            # per-task "no valid node correspondence" flag
-    # each kernel gets its own block size, sized independently from the largest task it will see
-    # (see _select_cuda_path_threads_per_block / _select_cuda_finalize_threads_per_block)
-    path_threads_per_block = _select_cuda_path_threads_per_block(
-        cp,
-        effective_path_lengths,
-        task_effective_a,
-        task_effective_b,
-    )
-    finalize_threads_per_block = _select_cuda_finalize_threads_per_block(cp, pair_task_offsets)
-    path_kernel = _get_cuda_distance_kernels(cp, path_threads_per_block)[0]
-    finalize_kernel = _get_cuda_distance_kernels(cp, finalize_threads_per_block)[1]
+    output = cp.empty(len(index_pairs), dtype=cuda_dtype)  # one final distance per index_pairs entry
+    task_values = cp.empty(num_tasks, dtype=cuda_dtype)    # per-task average node distance (kernel 1's output)
+
     if num_tasks > 0:
-        # kernel 1: one CUDA block per task, filling task_values/task_invalid in place
-        path_kernel(
-            (num_tasks,),
-            (path_threads_per_block,),
+        # kernel 1, bucketed: one right-sized path_kernel launch per distinct block size, each
+        # covering only the tasks whose own length_a + length_b needs that many threads (see
+        # _bucket_by_block_size); every bucket writes into its own small output slice, then scatters
+        # it into the batch-wide task_values at that bucket's original task positions. shared_mem=
+        # reserves exactly threads_per_block * cuda_itemsize bytes of dynamic shared memory for this
+        # launch - sized to what this bucket's block actually needs, not a compile-time constant.
+        lengths_host = cp.asnumpy(effective_path_lengths)
+        task_total_length = lengths_host[task_effective_a] + lengths_host[task_effective_b]
+        for threads_per_block, bucket_indices in _bucket_by_block_size(cp, task_total_length):
+            bucket_size = int(bucket_indices.size)
+            bucket_task_values = cp.empty(bucket_size, dtype=cuda_dtype)
+            path_kernel(
+                (bucket_size,),
+                (threads_per_block,),
+                (
+                    nodes,
+                    path_nodes,
+                    effective_path_offsets,
+                    effective_path_lengths,
+                    last_layers,
+                    first_terminal_layers,
+                    cp.asarray(task_effective_a[bucket_indices]),
+                    cp.asarray(task_effective_b[bucket_indices]),
+                    cp.asarray(task_cluster_a[bucket_indices]),
+                    cp.asarray(task_cluster_b[bucket_indices]),
+                    np.int64(bucket_size),
+                    bucket_task_values,
+                ),
+                shared_mem=threads_per_block * cuda_itemsize,
+            )
+            task_values[cp.asarray(bucket_indices)] = bucket_task_values
+
+    # kernel 2, bucketed the same way: one right-sized finalize_kernel launch per distinct block
+    # size, grouping cluster pairs by how many tasks each needs to average over. Runs even with
+    # num_tasks == 0 (every pair then lands in the smallest bucket) so misaligned-only batches still
+    # get their 999.0 sentinel written.
+    pair_task_start_all = pair_task_offsets[:-1]
+    pair_task_end_all = pair_task_offsets[1:]
+    pair_task_counts = pair_task_end_all - pair_task_start_all
+    cutoff_value = cuda_dtype(cutoff)
+    for threads_per_block, bucket_indices in _bucket_by_block_size(cp, pair_task_counts):
+        bucket_size = int(bucket_indices.size)
+        bucket_output = cp.empty(bucket_size, dtype=cuda_dtype)
+        finalize_kernel(
+            (bucket_size,),
+            (threads_per_block,),
             (
-                nodes,
-                path_nodes,
-                effective_path_offsets,
-                effective_path_lengths,
-                last_layers,
-                first_terminal_layers,
-                cp.asarray(task_effective_a),
-                cp.asarray(task_effective_b),
-                cp.asarray(task_cluster_a),
-                cp.asarray(task_cluster_b),
-                np.int64(num_tasks),
                 task_values,
-                task_invalid,
+                cp.asarray(pair_task_start_all[bucket_indices]),
+                cp.asarray(pair_task_end_all[bucket_indices]),
+                cp.asarray(exact_pairs[bucket_indices]),
+                cp.asarray(misaligned_pairs[bucket_indices]),
+                cutoff_value,
+                np.int64(bucket_size),
+                bucket_output,
             ),
+            shared_mem=threads_per_block * cuda_itemsize,
         )
-    # kernel 2: one CUDA block per requested cluster pair, averaging that pair's task_values
-    # (or applying the misaligned/cutoff sentinel) into 'output'; runs even with num_tasks == 0
-    # so misaligned-only batches still get their 999.0 sentinel written
-    finalize_kernel(
-        (len(index_pairs),),
-        (finalize_threads_per_block,),
-        (
-            task_values,
-            task_invalid,
-            cp.asarray(pair_task_offsets[:-1]),
-            cp.asarray(pair_task_offsets[1:]),
-            cp.asarray(exact_pairs),
-            cp.asarray(misaligned_pairs),
-            np.float64(cutoff),
-            np.int64(len(index_pairs)),
-            output,
-        ),
-    )
-    distances = cp.asnumpy(output)
+        output[cp.asarray(bucket_indices)] = bucket_output
+
+    # upcast before rounding to 'precision' decimals below, regardless of the CUDA compute dtype
+    distances = cp.asnumpy(output).astype(np.float64, copy=False)
 
     # same NaN -> exact-reference-implementation fallback as calc_distance_batch_compiled
     for pair_id in np.flatnonzero(~np.isfinite(distances)):
