@@ -11,9 +11,12 @@ _cuda_distance_rawkernel.py (select it via TRANSPORT_TOOLS_CUDA_KERNEL=raw, see
 get_distance_kernels() below) for the last bit of performance margin - see
 benchmarks/cuda_distance_backends_benchmark_en.md for the measured difference between the two.
 
-All node data is a flat float64 array with 7 columns per node - x, y, z, layer_id, is_terminal,
-radius, rmsf (same layout as geometry._prepare_compiled_path_sets/_prepare_kernel_path_sets) -
-addressed here as nodes[node_id * 7 + column].
+All node data is a flat array with 7 columns per node - x, y, z, layer_id, is_terminal, radius,
+rmsf (same layout as geometry._prepare_compiled_path_sets/_prepare_kernel_path_sets) - addressed
+here as nodes[node_id * 7 + column]. Its element dtype is float64 by default, or float32 when
+TRANSPORT_TOOLS_CUDA_PRECISION=float32 (see get_distance_kernels() below) - the caller
+(geometry.calc_distance_batch_kernel) uploads 'nodes' in whichever dtype the selected kernel
+was compiled for.
 """
 
 from __future__ import annotations
@@ -21,27 +24,44 @@ from __future__ import annotations
 import os
 
 
-_JIT_DISTANCE_KERNELS = {}  # cache keyed by threads_per_block, so each block size is only compiled once
+_JIT_DISTANCE_KERNELS = {}  # cache keyed by (threads_per_block, precision), so each combination compiles once
 
 
-def get_jit_distance_kernels(cp, threads_per_block=256):
+def get_jit_distance_kernels(cp, threads_per_block=256, precision="float64"):
     """
-    Compile (or return from cache) the pair of cupyx.jit kernels for the given block size:
-    path_pair_node_distances (per-effective-path-pair task) and finalize_cluster_pair_distances
-    (per-cluster-pair aggregation) - see geometry.calc_distance_batch_kernel for how they are
-    launched together. threads_per_block is baked into the compiled kernels only through the
-    shared-memory allocation size below, so a distinct kernel is compiled per block size requested.
+    Compile (or return from cache) the pair of cupyx.jit kernels for the given block size and
+    floating-point precision: path_pair_node_distances (per-effective-path-pair task) and
+    finalize_cluster_pair_distances (per-cluster-pair aggregation) - see
+    geometry.calc_distance_batch_kernel for how they are launched together. threads_per_block and
+    precision are both baked into the compiled kernels (block size through the shared-memory
+    allocation size, precision through every arithmetic literal below), so a distinct kernel is
+    compiled per (threads_per_block, precision) combination requested.
+
+    precision='float32' trades numerical accuracy for throughput: many consumer/workstation-class
+    GPUs (this one included - see benchmarks/distance_backend_report.tex) cap float64 arithmetic
+    throughput at a small fraction of float32's, and the node-distance computation here
+    (surface_distance) is float64 arithmetic dominated. It is opt-in (default 'float64', matching
+    every existing caller and the CPU/NumPy reference backends exactly) because it changes what is
+    computed, not just how - callers must re-validate their own accuracy tolerance against it.
     :param cp: the imported cupy module (only used for the device-side dtypes it exposes)
     :param threads_per_block: CUDA block size these kernels will be launched with
+    :param precision: 'float64' (default) or 'float32'
     :return: (path_pair_node_distances, finalize_cluster_pair_distances) compiled kernel functions
     """
 
     global _JIT_DISTANCE_KERNELS
-    if threads_per_block in _JIT_DISTANCE_KERNELS:
-        return _JIT_DISTANCE_KERNELS[threads_per_block]
+    cache_key = (threads_per_block, precision)
+    if cache_key in _JIT_DISTANCE_KERNELS:
+        return _JIT_DISTANCE_KERNELS[cache_key]
+    if precision not in ("float32", "float64"):
+        raise ValueError(f"Unsupported precision={precision!r}; use 'float32' or 'float64'")
 
     import cupy
     import cupyx.jit as jit
+
+    # every device-side literal below is constructed through this instead of a hardcoded
+    # cupy.float64(...), so the same kernel source compiles to either precision
+    float_type = cupy.float32 if precision == "float32" else cupy.float64
 
     @jit.rawkernel(device=True)
     def adjacent(query_layer, candidate_layer, query_last_layer, candidate_last_layer, query_first_terminal):
@@ -112,7 +132,7 @@ def get_jit_distance_kernels(cp, threads_per_block=256):
         path_offset_a = effective_path_offsets[effective_path_a]
         path_offset_b = effective_path_offsets[effective_path_b]
 
-        local_sum = cupy.float64(0.0)
+        local_sum = float_type(0.0)
         local_invalid = 0
         total_length = length_a + length_b
 
@@ -127,7 +147,7 @@ def get_jit_distance_kernels(cp, threads_per_block=256):
                 node_a = path_nodes[path_offset_a + work]
                 layer_a = nodes[node_a * 7 + 3]
                 if layer_a >= 0.0:
-                    minimum = cupy.float64(1.0e30)
+                    minimum = float_type(1.0e30)
                     node_index_b = 0
                     while node_index_b < length_b:
                         node_b = path_nodes[path_offset_b + node_index_b]
@@ -173,7 +193,7 @@ def get_jit_distance_kernels(cp, threads_per_block=256):
                             break
                         node_index_a += 1
 
-                    minimum = cupy.float64(1.0e30)
+                    minimum = float_type(1.0e30)
                     node_index_a = 0
                     while node_index_a < length_a:
                         node_a = path_nodes[path_offset_a + node_index_a]
@@ -208,8 +228,8 @@ def get_jit_distance_kernels(cp, threads_per_block=256):
         # standard shared-memory tree reduction: each thread parks its local partial sum/invalid
         # flag, then pairs of threads combine in halving strides until index 0 holds the block
         # total. Requires threads_per_block to be a power of two (enforced by
-        # geometry._select_cuda_threads_for_work, which sized this launch).
-        sums = jit.shared_memory(cupy.float64, threads_per_block)
+        # geometry._bucket_by_block_size, which sized this launch).
+        sums = jit.shared_memory(float_type, threads_per_block)
         invalid = jit.shared_memory(cupy.int32, threads_per_block)
         sums[thread_id] = local_sum
         invalid[thread_id] = local_invalid
@@ -239,7 +259,8 @@ def get_jit_distance_kernels(cp, threads_per_block=256):
     def finalize_cluster_pair_distances(
         task_values,
         task_invalid,
-        pair_task_offsets,
+        pair_task_start,
+        pair_task_end,
         exact_pairs,
         misaligned_pairs,
         distance_cutoff,
@@ -247,8 +268,11 @@ def get_jit_distance_kernels(cp, threads_per_block=256):
         output,
     ):
         # one CUDA block per requested cluster pair, averaging that pair's task_values (written by
-        # path_pair_node_distances) over pair_task_offsets[pair_id]:pair_task_offsets[pair_id+1] -
-        # i.e. over every effective-path-a/effective-path-b combination for that cluster pair
+        # path_pair_node_distances) over pair_task_start[pair_id]:pair_task_end[pair_id] - i.e.
+        # over every effective-path-a/effective-path-b combination for that cluster pair. Taken as
+        # two independent per-pair arrays (rather than one cumulative offsets array indexed by
+        # pair_id and pair_id+1) so geometry.calc_distance_batch_kernel can freely reorder pairs
+        # into size buckets without losing either endpoint of a pair's own task range.
         pair_id = jit.blockIdx.x
         thread_id = jit.threadIdx.x
         block_size = jit.blockDim.x
@@ -262,10 +286,10 @@ def get_jit_distance_kernels(cp, threads_per_block=256):
                 output[pair_id] = 999.0
             return
 
-        start = pair_task_offsets[pair_id]
-        end = pair_task_offsets[pair_id + 1]
+        start = pair_task_start[pair_id]
+        end = pair_task_end[pair_id]
         num_path_pairs = end - start
-        local_sum = cupy.float64(0.0)
+        local_sum = float_type(0.0)
         local_invalid = 0
 
         task_id = start + thread_id
@@ -274,7 +298,7 @@ def get_jit_distance_kernels(cp, threads_per_block=256):
             local_sum += task_values[task_id]
             task_id += block_size
 
-        sums = jit.shared_memory(cupy.float64, threads_per_block)
+        sums = jit.shared_memory(float_type, threads_per_block)
         invalid = jit.shared_memory(cupy.int32, threads_per_block)
         sums[thread_id] = local_sum
         invalid[thread_id] = local_invalid
@@ -301,11 +325,11 @@ def get_jit_distance_kernels(cp, threads_per_block=256):
             else:
                 output[pair_id] = sums[0] / num_path_pairs
 
-    _JIT_DISTANCE_KERNELS[threads_per_block] = (
+    _JIT_DISTANCE_KERNELS[cache_key] = (
         path_pair_node_distances,
         finalize_cluster_pair_distances,
     )
-    return _JIT_DISTANCE_KERNELS[threads_per_block]
+    return _JIT_DISTANCE_KERNELS[cache_key]
 
 
 def get_distance_kernels(cp, threads_per_block=256):
@@ -313,8 +337,11 @@ def get_distance_kernels(cp, threads_per_block=256):
     Return the (path_pair_node_distances, finalize_cluster_pair_distances) kernel pair for the
     selected CUDA implementation - the Python-readable cupyx.jit backend defined above (default),
     or the equivalent hand-written CUDA C RawKernel backend, selected by setting the
-    TRANSPORT_TOOLS_CUDA_KERNEL environment variable to 'jit' (default) or 'raw'. This is the
-    single entry point geometry.py's _get_cuda_distance_kernels() calls.
+    TRANSPORT_TOOLS_CUDA_KERNEL environment variable to 'jit' (default) or 'raw'. The floating-point
+    precision used internally is controlled independently via TRANSPORT_TOOLS_CUDA_PRECISION
+    ('float64' default, or 'float32' - see get_jit_distance_kernels for the accuracy/throughput
+    trade-off; not yet wired through to the 'raw' RawKernel backend). This is the single entry
+    point geometry.py's _get_cuda_distance_kernels() calls.
     :param cp: the imported cupy module, forwarded to whichever backend is selected
     :param threads_per_block: CUDA block size to compile/launch the kernels with
     :return: (path_pair_node_distances, finalize_cluster_pair_distances) kernel functions
@@ -326,7 +353,8 @@ def get_distance_kernels(cp, threads_per_block=256):
         return _cuda_distance_rawkernel.get_distance_kernels(cp, threads_per_block)
     if backend != "jit":
         raise ValueError(f"Unsupported TRANSPORT_TOOLS_CUDA_KERNEL={backend!r}; use 'jit' or 'raw'")
-    return get_jit_distance_kernels(cp, threads_per_block)
+    precision = os.environ.get("TRANSPORT_TOOLS_CUDA_PRECISION", "float64").strip().lower()
+    return get_jit_distance_kernels(cp, threads_per_block, precision)
 
 
 def get_distance_kernel(cp):
